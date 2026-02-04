@@ -12,13 +12,11 @@ function App() {
 	const [isUploading, setIsUploading] = useState(false);
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [testCases, setTestCases] = useState(10);
-	const [generatedData, setGeneratedData] = useState<
-		Record<string, unknown>[] | null
-	>(null);
+	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
 
 	const handleFileSelect = async (file: File) => {
 		setIsUploading(true);
-		setGeneratedData(null);
+		setGeneratedSheets(null);
 
 		try {
 			const formData = new FormData();
@@ -64,7 +62,7 @@ function App() {
 			if (!response.ok) throw new Error("Generation failed");
 
 			const data = await response.json();
-			setGeneratedData(data.data);
+			setGeneratedSheets(data.sheets_generated);
 		} catch (error) {
 			console.error("Generation error:", error);
 			alert("Failed to generate test cases. Please try again.");
@@ -143,23 +141,21 @@ function App() {
 				disabled={!sessionId || isUploading || isGenerating}
 				className="w-full"
 			>
-				{isGenerating ? "Generating..." : "Generate Test Cases"}
+				{isGenerating ? "Generating..." : "Generate Test Data"}
 			</Button>
 
-			{generatedData && (
+			{generatedSheets && (
 				<div className="w-full flex flex-col gap-3">
 					<h2 className="text-sm font-medium">
-						Generated Data ({generatedData.length} rows)
+						✅ Test Data Generated for {generatedSheets.length} sheet
+						{generatedSheets.length > 1 ? "s" : ""}
 					</h2>
-					<div className="border rounded-lg p-4 max-h-60 overflow-auto">
-						<pre className="text-xs">
-							{JSON.stringify(generatedData.slice(0, 3), null, 2)}
-						</pre>
-						{generatedData.length > 3 && (
-							<p className="text-xs text-gray-500 mt-2">
-								...and {generatedData.length - 3} more rows
-							</p>
-						)}
+					<div className="border rounded-lg p-4">
+						<ul className="text-sm text-gray-600 space-y-1">
+							{generatedSheets.map((sheetName) => (
+								<li key={sheetName}>• {sheetName}</li>
+							))}
+						</ul>
 					</div>
 					<Button onClick={handleDownload} variant="outline" className="w-full">
 						Download Excel

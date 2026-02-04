@@ -29,10 +29,11 @@ IMPORTANT RULES:
    - ZIP: 5 digits or ZIP+4
    - State: 2-letter abbreviations (CA, TX, NY, etc.)
    - Dates: MM/DD/YYYY format
-3. For policy numbers, use realistic formats like: POL-XXXXXXXX
+3. For policy numbers, use realistic formats used in United states.
 4. For currency amounts, use realistic insurance values
 5. Names should be diverse and realistic
 6. Addresses should be realistic US addresses
+7.For vehicals no and other vehical detail make sure you follow the United states formats.
 
 Return ONLY a valid JSON array of objects with the exact column names as keys.
 No markdown, no explanation, just the JSON array.
