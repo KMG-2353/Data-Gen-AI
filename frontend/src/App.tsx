@@ -1,4 +1,5 @@
 import { useState } from "react";
+import TextareaAutoGrowDemo from "./components/shadcn-studio/textarea/textarea-17.tsx";
 import { Button } from "./components/ui/button.tsx";
 import { Input } from "./components/ui/input";
 import FileUpload from "./components/ui/upload.tsx";
@@ -9,11 +10,11 @@ function App() {
 	>({});
 	const [sheetNames, setSheetNames] = useState<string[]>([]);
 	const [sessionId, setSessionId] = useState<string | null>(null);
+	const [sepcialinstruction, setSepcialinstruction] = useState("");
 	const [isUploading, setIsUploading] = useState(false);
 	const [isGenerating, setIsGenerating] = useState(false);
-	const [testCases, setTestCases] = useState(10);
+	const [testCases, setTestCases] = useState(5);
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
-
 	const handleFileSelect = async (file: File) => {
 		setIsUploading(true);
 		setGeneratedSheets(null);
@@ -56,6 +57,7 @@ function App() {
 				body: JSON.stringify({
 					session_id: sessionId,
 					row_count: testCases,
+					special_inst: sepcialinstruction,
 				}),
 			});
 
@@ -90,13 +92,11 @@ function App() {
 	return (
 		<div className="flex h-screen m-auto w-1/2 max-w-2xl justify-center items-center flex-col gap-5 p-8">
 			<h1 className="text-2xl font-bold">AI Testing Agent</h1>
-
 			<div className="w-full flex flex-col gap-3">
 				<h2 className="text-sm font-medium">Upload Excel File</h2>
 				<FileUpload onFileSelect={handleFileSelect} />
 				{isUploading && <p className="text-sm text-gray-500">Uploading...</p>}
 			</div>
-
 			{sheetNames.length > 0 && (
 				<div className="w-full flex flex-col gap-3">
 					<h2 className="text-sm font-medium">
@@ -124,7 +124,6 @@ function App() {
 					</div>
 				</div>
 			)}
-
 			<div className="w-full flex flex-col gap-3">
 				<h2 className="text-sm font-medium">Number of Test Cases</h2>
 				<Input
@@ -134,8 +133,11 @@ function App() {
 					min={1}
 					max={500}
 				/>
+				<TextareaAutoGrowDemo
+					value={sepcialinstruction}
+					inputchange={setSepcialinstruction}
+				/>
 			</div>
-
 			<Button
 				onClick={handleGenerateTestCases}
 				disabled={!sessionId || isUploading || isGenerating}
@@ -143,7 +145,6 @@ function App() {
 			>
 				{isGenerating ? "Generating..." : "Generate Test Data"}
 			</Button>
-
 			{generatedSheets && (
 				<div className="w-full flex flex-col gap-3">
 					<h2 className="text-sm font-medium">

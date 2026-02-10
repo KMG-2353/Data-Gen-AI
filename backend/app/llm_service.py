@@ -9,17 +9,19 @@ def configure_gemini(api_key: str = None):
         raise ValueError("GEMINI_API_KEY not found")
     genai.configure(api_key=key)
 
-def generate_test_data(headers: list[str], row_count: int) -> list[dict]:
+def generate_test_data(headers: list[str], row_count: int,special_instruction:str) -> list[dict]:
     """Generate test data using Gemini for US insurance domain"""
     
     configure_gemini()
-    
+
     model = genai.GenerativeModel("gemini-3-flash-preview")
     
     prompt = f"""You are a test data generator for US insurance applications.
 
 Generate exactly {row_count} rows of realistic test data for the following columns:
 {json.dumps(headers)}
+
+Make sure, you follow the below important rules below and {special_instruction} given by users for particular sheet and column name. 
 
 IMPORTANT RULES:
 1. Generate realistic US insurance test data
@@ -40,6 +42,8 @@ No markdown, no explanation, just the JSON array.
 
 Example format:
 [{{"column1": "value1", "column2": "value2"}}, ...]
+
+
 """
 
     response = model.generate_content(prompt)

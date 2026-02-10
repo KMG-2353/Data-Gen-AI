@@ -29,9 +29,9 @@ app.add_middleware(
 # Store uploaded file data temporarily
 sessions = {}
 
-@app.get("/api/hello")
-def read_hello():
-    return {"message": "Test123"}
+# @app.get("/api/hello")
+# def read_hello():
+#     return {"message": "Test123"}
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -86,7 +86,7 @@ async def generate_data(request: dict):
     """Generate test data using LLM for all sheets"""
     session_id = request.get("session_id")
     row_count = request.get("row_count", 10)
-    
+    special_instructions=request.get("special_inst","")
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
@@ -98,12 +98,12 @@ async def generate_data(request: dict):
         
         for sheet_name, headers in headers_by_sheet.items():
             print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {headers}")
-            data = generate_test_data(headers, row_count)
+            data = generate_test_data(headers, row_count,special_instructions)
             generated_data_by_sheet[sheet_name] = {
                 "headers": headers,
                 "data": data
             }
-            print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
+            print(f"Generated {len(data)} rows for sheet '{sheet_name}' with special instruction'{special_instructions}' successfully")
         
         # Store generated data in session
         sessions[session_id]["generated_data_by_sheet"] = generated_data_by_sheet
