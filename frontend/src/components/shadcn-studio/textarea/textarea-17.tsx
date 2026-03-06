@@ -18,7 +18,7 @@ const TextareaAutoGrowDemo = ({ value, inputchange }: specialinstrction) => {
 			<Label htmlFor={id}>Important Rules</Label>
 			<Textarea
 				id={id}
-				placeholder="Special Instructions"
+				placeholder="Specific Instructions"
 				className="field-sizing-content max-h-30 min-h-0 resize-none py-1.75"
 				onChange={handlechange}
 			/>

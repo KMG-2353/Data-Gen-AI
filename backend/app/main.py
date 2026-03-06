@@ -93,17 +93,31 @@ async def generate_data(request: dict):
     headers_by_sheet = sessions[session_id]["headers_by_sheet"]
     
     try:
-        # Generate data for ALL sheets
+        # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
+        previous_sheets_data = {}
         
         for sheet_name, headers in headers_by_sheet.items():
             print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {headers}")
-            data = generate_test_data(headers, row_count,special_instructions)
+            
+            # Pass previously generated sheets so LLM can maintain cross-sheet consistency
+            data = generate_test_data(
+                headers=headers,
+                row_count=row_count,
+                special_instruction=special_instructions,
+                sheet_name=sheet_name,
+                previous_sheets_data=previous_sheets_data if previous_sheets_data else None
+            )
+            
             generated_data_by_sheet[sheet_name] = {
                 "headers": headers,
                 "data": data
             }
-            print(f"Generated {len(data)} rows for sheet '{sheet_name}' with special instruction'{special_instructions}' successfully")
+            
+            # Add this sheet's data to context for subsequent sheets
+            previous_sheets_data[sheet_name] = data
+            
+            print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
         
         # Store generated data in session
         sessions[session_id]["generated_data_by_sheet"] = generated_data_by_sheet

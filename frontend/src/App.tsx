@@ -91,9 +91,11 @@ function App() {
 
 	return (
 		<div className="flex h-screen m-auto w-1/2 max-w-2xl justify-center items-center flex-col gap-5 p-8">
-			<h1 className="text-2xl font-bold">AI Testing Agent</h1>
+			<h1 className="text-2xl font-bold">Data Gen Agent</h1>
 			<div className="w-full flex flex-col gap-3">
-				<h2 className="text-sm font-medium">Upload Excel File</h2>
+				<h2 className="text-sm font-medium">
+					Upload your sample data sheet (accepted format - .xlsx)
+				</h2>
 				<FileUpload onFileSelect={handleFileSelect} />
 				{isUploading && <p className="text-sm text-gray-500">Uploading...</p>}
 			</div>
@@ -125,7 +127,9 @@ function App() {
 				</div>
 			)}
 			<div className="w-full flex flex-col gap-3">
-				<h2 className="text-sm font-medium">Number of Test Cases</h2>
+				<h2 className="text-sm font-medium">
+					Number of test data records to be generated{" "}
+				</h2>
 				<Input
 					type="number"
 					value={testCases}
