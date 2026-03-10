@@ -2,6 +2,15 @@ import { useState } from "react";
 import TextareaAutoGrowDemo from "./components/shadcn-studio/textarea/textarea-17.tsx";
 import { Button } from "./components/ui/button.tsx";
 import { Input } from "./components/ui/input";
+import {
+	Select,
+	SelectContent,
+	SelectGroup,
+	SelectItem,
+	SelectLabel,
+	SelectTrigger,
+	SelectValue,
+} from "./components/ui/select";
 import FileUpload from "./components/ui/upload.tsx";
 
 function App() {
@@ -13,6 +22,8 @@ function App() {
 	const [sepcialinstruction, setSepcialinstruction] = useState("");
 	const [isUploading, setIsUploading] = useState(false);
 	const [isGenerating, setIsGenerating] = useState(false);
+	const [lineOfBusiness, setLineOfBusiness] = useState<string>("");
+	const [coverage, setCoverage] = useState<string>("");
 	const [testCases, setTestCases] = useState(5);
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
 	const handleFileSelect = async (file: File) => {
@@ -141,6 +152,56 @@ function App() {
 					value={sepcialinstruction}
 					inputchange={setSepcialinstruction}
 				/>
+			</div>
+			<div className="w-full flex gap-3">
+				<Select
+					value={lineOfBusiness}
+					onValueChange={(val) => {
+						setLineOfBusiness(val);
+						setCoverage("");
+					}}
+				>
+					<SelectTrigger className="w-full max-w-48">
+						<SelectValue placeholder="Number of Lines" />
+					</SelectTrigger>
+					<SelectContent>
+						<SelectGroup>
+							<SelectLabel>Number of Lines</SelectLabel>
+							<SelectItem value="Monoline">Monoline</SelectItem>
+							<SelectItem value="Multiline">Multiline</SelectItem>
+						</SelectGroup>
+					</SelectContent>
+				</Select>
+
+				{lineOfBusiness && (
+					<Select value={coverage} onValueChange={setCoverage}>
+						<SelectTrigger className="w-full max-w-56">
+							<SelectValue placeholder="Select Coverage" />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectGroup>
+								<SelectLabel>Line of Business</SelectLabel>
+								{lineOfBusiness === "Monoline" ? (
+									<SelectItem value="GL">GL</SelectItem>
+								) : (
+									<>
+										<SelectItem value="Inline Marine">Inline Marine</SelectItem>
+										<SelectItem value="Crime">Crime</SelectItem>
+										<SelectItem value="General Liability">
+											General Liability
+										</SelectItem>
+										<SelectItem value="Optional Coverage">
+											Optional Coverage
+										</SelectItem>
+										<SelectItem value="Commercial Auto">
+											Commercial Auto
+										</SelectItem>
+									</>
+								)}
+							</SelectGroup>
+						</SelectContent>
+					</Select>
+				)}
 			</div>
 			<Button
 				onClick={handleGenerateTestCases}

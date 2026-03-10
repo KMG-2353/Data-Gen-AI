@@ -49,6 +49,11 @@ You are generating data for sheet: "{sheet_name}"
 Generate exactly {row_count} rows of realistic test data for the following columns:
 {json.dumps(headers)}
 
+DUPLICATE COLUMN HANDLING:
+Some columns may have a suffix like "(Col X)" — this means the original spreadsheet has multiple columns with the same name. 
+You MUST generate DIFFERENT values for each such column. For example, "Address (Col 3)" and "Address (Col 7)" are two separate columns that need different address values.
+Use ALL column names exactly as provided (including suffixes) as JSON keys.
+
 {previous_context}
 
 Make sure you follow the below important rules and {special_instruction} given by users for particular sheet and column name.

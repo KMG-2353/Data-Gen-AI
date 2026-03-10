@@ -47,14 +47,29 @@ async def upload_file(file: UploadFile = File(...)):
         workbook = load_workbook(BytesIO(content), read_only=True)
         
         # Extract headers from first row of all sheets
-        headers_by_sheet = {}
+        headers_by_sheet = {}       # original names (for display & Excel output)
+        unique_headers_by_sheet = {} # deduplicated names (for LLM)
         for sheet in workbook.worksheets:
-            sheet_headers = []
+            original_headers = []
             for cell in sheet[1]:
                 if cell.value:
-                    sheet_headers.append(str(cell.value))
-            if sheet_headers:
-                headers_by_sheet[sheet.title] = sheet_headers
+                    original_headers.append(str(cell.value))
+            if not original_headers:
+                continue
+            
+            # Make duplicate headers unique by appending column position
+            seen = {}
+            unique_headers = []
+            for idx, h in enumerate(original_headers):
+                if original_headers.count(h) > 1:
+                    # Track occurrence number
+                    seen[h] = seen.get(h, 0) + 1
+                    unique_headers.append(f"{h} (Col {idx + 1})")
+                else:
+                    unique_headers.append(h)
+            
+            headers_by_sheet[sheet.title] = original_headers
+            unique_headers_by_sheet[sheet.title] = unique_headers
         
         workbook.close()
         
@@ -67,6 +82,7 @@ async def upload_file(file: UploadFile = File(...)):
         # Store session data
         sessions[session_id] = {
             "headers_by_sheet": headers_by_sheet,
+            "unique_headers_by_sheet": unique_headers_by_sheet,
             "filename": file.filename
         }
         
@@ -90,19 +106,21 @@ async def generate_data(request: dict):
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    headers_by_sheet = sessions[session_id]["headers_by_sheet"]
+    unique_headers_by_sheet = sessions[session_id]["unique_headers_by_sheet"]
+    original_headers_by_sheet = sessions[session_id]["headers_by_sheet"]
     
     try:
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
         previous_sheets_data = {}
         
-        for sheet_name, headers in headers_by_sheet.items():
-            print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {headers}")
+        for sheet_name, unique_headers in unique_headers_by_sheet.items():
+            original_headers = original_headers_by_sheet[sheet_name]
+            print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {unique_headers}")
             
-            # Pass previously generated sheets so LLM can maintain cross-sheet consistency
+            # Send unique (deduplicated) headers to LLM
             data = generate_test_data(
-                headers=headers,
+                headers=unique_headers,
                 row_count=row_count,
                 special_instruction=special_instructions,
                 sheet_name=sheet_name,
@@ -110,7 +128,8 @@ async def generate_data(request: dict):
             )
             
             generated_data_by_sheet[sheet_name] = {
-                "headers": headers,
+                "original_headers": original_headers,
+                "unique_headers": unique_headers,
                 "data": data
             }
             
@@ -155,17 +174,18 @@ async def download_excel(session_id: str):
     # Create a sheet for each generated dataset
     for sheet_name, sheet_data in generated_data_by_sheet.items():
         sheet = workbook.create_sheet(title=sheet_name[:31])  # Excel limits sheet names to 31 chars
-        headers = sheet_data["headers"]
+        original_headers = sheet_data["original_headers"]
+        unique_headers = sheet_data["unique_headers"]
         data = sheet_data["data"]
         
-        # Write headers
-        for col, header in enumerate(headers, 1):
+        # Write original headers in row 1
+        for col, header in enumerate(original_headers, 1):
             sheet.cell(row=1, column=col, value=header)
         
-        # Write data rows
+        # Write data rows using unique header keys to look up values
         for row_idx, row_data in enumerate(data, 2):
-            for col_idx, header in enumerate(headers, 1):
-                value = row_data.get(header, "")
+            for col_idx, unique_header in enumerate(unique_headers, 1):
+                value = row_data.get(unique_header, "")
                 sheet.cell(row=row_idx, column=col_idx, value=value)
         
         # Auto-adjust column widths
