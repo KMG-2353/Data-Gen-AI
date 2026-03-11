@@ -137,6 +137,7 @@ function App() {
 					</div>
 				</div>
 			)}
+
 			<div className="w-full flex flex-col gap-3">
 				<h2 className="text-sm font-medium">
 					Number of test data records to be generated{" "}
@@ -148,61 +149,74 @@ function App() {
 					min={1}
 					max={500}
 				/>
+				<div className="w-full flex gap-3">
+					<Select
+						value={lineOfBusiness}
+						onValueChange={(val) => {
+							setLineOfBusiness(val);
+							setCoverage("");
+						}}
+					>
+						<SelectTrigger className="w-full max-w-48">
+							<SelectValue placeholder="Select LOB" />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectGroup>
+								<SelectLabel>Select LOB</SelectLabel>
+								<SelectItem value="Monoline">Monoline</SelectItem>
+								<SelectItem value="Multiline">Multiline</SelectItem>
+							</SelectGroup>
+						</SelectContent>
+					</Select>
+
+					{lineOfBusiness && (
+						<Select value={coverage} onValueChange={setCoverage}>
+							{lineOfBusiness === "Monoline" ? (
+								<SelectTrigger className="w-full max-w-56">
+									<SelectValue placeholder="Select" />
+								</SelectTrigger>
+							) : (
+								<SelectTrigger className="w-full max-w-56">
+									<SelectValue placeholder="Select Multiple" />
+								</SelectTrigger>
+							)}
+
+							<SelectContent>
+								<SelectGroup>
+									{lineOfBusiness === "Monoline" ? (
+										<div>
+											<SelectLabel>Select</SelectLabel>
+											<SelectItem value="GL">GL</SelectItem>
+										</div>
+									) : (
+										<>
+											<SelectLabel>Select Multi</SelectLabel>
+											<SelectItem value="Inline Marine">
+												Inline Marine
+											</SelectItem>
+											<SelectItem value="Crime">Crime</SelectItem>
+											<SelectItem value="General Liability">
+												General Liability
+											</SelectItem>
+											<SelectItem value="Optional Coverage">
+												Optional Coverage
+											</SelectItem>
+											<SelectItem value="Commercial Auto">
+												Commercial Auto
+											</SelectItem>
+										</>
+									)}
+								</SelectGroup>
+							</SelectContent>
+						</Select>
+					)}
+				</div>
 				<TextareaAutoGrowDemo
 					value={sepcialinstruction}
 					inputchange={setSepcialinstruction}
 				/>
 			</div>
-			<div className="w-full flex gap-3">
-				<Select
-					value={lineOfBusiness}
-					onValueChange={(val) => {
-						setLineOfBusiness(val);
-						setCoverage("");
-					}}
-				>
-					<SelectTrigger className="w-full max-w-48">
-						<SelectValue placeholder="Number of Lines" />
-					</SelectTrigger>
-					<SelectContent>
-						<SelectGroup>
-							<SelectLabel>Number of Lines</SelectLabel>
-							<SelectItem value="Monoline">Monoline</SelectItem>
-							<SelectItem value="Multiline">Multiline</SelectItem>
-						</SelectGroup>
-					</SelectContent>
-				</Select>
 
-				{lineOfBusiness && (
-					<Select value={coverage} onValueChange={setCoverage}>
-						<SelectTrigger className="w-full max-w-56">
-							<SelectValue placeholder="Select Coverage" />
-						</SelectTrigger>
-						<SelectContent>
-							<SelectGroup>
-								<SelectLabel>Line of Business</SelectLabel>
-								{lineOfBusiness === "Monoline" ? (
-									<SelectItem value="GL">GL</SelectItem>
-								) : (
-									<>
-										<SelectItem value="Inline Marine">Inline Marine</SelectItem>
-										<SelectItem value="Crime">Crime</SelectItem>
-										<SelectItem value="General Liability">
-											General Liability
-										</SelectItem>
-										<SelectItem value="Optional Coverage">
-											Optional Coverage
-										</SelectItem>
-										<SelectItem value="Commercial Auto">
-											Commercial Auto
-										</SelectItem>
-									</>
-								)}
-							</SelectGroup>
-						</SelectContent>
-					</Select>
-				)}
-			</div>
 			<Button
 				onClick={handleGenerateTestCases}
 				disabled={!sessionId || isUploading || isGenerating}
