@@ -5,7 +5,7 @@ import time
 
 def configure_gemini(api_key: str = None):
     """Configure Gemini with API key"""
-    key = "AIzaSyCT5Pnxw5xMPt9RAW_-mCZ8pJlv6ejTIgk" or os.getenv("GEMINI_API_KEY")
+    key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise ValueError("GEMINI_API_KEY not found")
     genai.configure(api_key=key)
