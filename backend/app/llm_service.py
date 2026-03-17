@@ -27,14 +27,13 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
         return parsed
     
     if isinstance(parsed, dict):
-        for key in ["data", "rows", "results", "items", "records"]:
-            if key in parsed and isinstance(parsed[key], list):
-                return parsed[key]
-        
+        # Look for any value that is a list of dicts (the generated rows)
         for value in parsed.values():
             if isinstance(value, list) and value and isinstance(value[0], dict):
                 return value
-    
+        # Fallback: single dict might be one row
+        return [parsed]
+
     raise ValueError(f"Model output is not a JSON array or wrapped array. Got: {type(parsed)}")
 
 def configure_openai() -> OpenAI:
@@ -54,7 +53,7 @@ def generate_test_data(
     """Generate test data using OpenAI for US insurance domain."""
 
     client = configure_openai()
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model_name = os.getenv("OPENAI_MODEL", "")
     
     # Build context from previously generated sheets
     previous_context = ""
@@ -119,11 +118,12 @@ IMPORTANT RULES:
 12. The effective date, expiration date should match across all sheets. There should not be mismatch for each test case row.
 13. Row 1 in this sheet corresponds to Row 1 in all other sheets (same insured/policy/location).
 
-Return ONLY a valid JSON array of objects with the exact column names as keys.
-No markdown, no explanation, just the JSON array.
+Return a JSON object with a single key "data" whose value is an array of {row_count} objects.
+Each object must use the exact column names as keys.
+No markdown, no explanation, just the JSON object.
 
 Example format:
-[{{"column1": "value1", "column2": "value2"}}, ...]
+{{"data": [{{"column1": "value1", "column2": "value2"}}, ...]}}
 """
 
     # Retry up to 2 times for rate limits only. JSON mode guarantees valid output.
@@ -132,12 +132,12 @@ Example format:
         try:
             response = client.chat.completions.create(
                 model=model_name,
-                temperature=0.2,
+                temperature=1,
                 response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a precise JSON-only data generator for US insurance test datasets. You MUST output valid JSON."
+                        "content": "You are a precise JSON-only data generator for US insurance test datasets. Always return a JSON object with a single key \"data\" containing an array of row objects."
                     },
                     {
                         "role": "user",
