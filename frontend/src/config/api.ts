@@ -1,5 +1,7 @@
 // API Configuration
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Production: https://data-gen-ai.onrender.com
+// Development: http://localhost:8000
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'https://data-gen-ai.onrender.com';
 
 export const apiConfig = {
   baseURL: API_BASE_URL,

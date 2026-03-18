@@ -16,11 +16,12 @@ app = FastAPI()
 # Configure CORS with environment-aware origins
 origins = [
     "http://localhost:5173",  # Development
+    "https://data-gen-ai-1.onrender.com",  # Production frontend
 ]
 
-# Add production frontend URL from environment
+# Add additional frontend URL from environment if specified
 frontend_url = os.getenv("FRONTEND_URL")
-if frontend_url:
+if frontend_url and frontend_url not in origins:
     origins.append(frontend_url)
 
 app.add_middleware(
