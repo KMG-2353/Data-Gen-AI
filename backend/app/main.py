@@ -13,10 +13,15 @@ load_dotenv()
 
 app = FastAPI()
 
-# Configure CORS
+# Configure CORS with environment-aware origins
 origins = [
-    "http://localhost:5173",  # Allow your Vite app's origin
+    "http://localhost:5173",  # Development
 ]
+
+# Add production frontend URL from environment
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url:
+    origins.append(frontend_url)
 
 app.add_middleware(
     CORSMiddleware,
