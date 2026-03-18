@@ -7,7 +7,7 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from llm_service import generate_test_data
+from app.llm_service import generate_test_data
 
 load_dotenv()
 
