@@ -6,7 +6,10 @@ type specialinstrction = {
 	value: string;
 	inputchange: (newvalue: string) => void;
 };
-const TextareaAutoGrowDemo = ({ value: _value, inputchange }: specialinstrction) => {
+const TextareaAutoGrowDemo = ({
+	value: _value,
+	inputchange,
+}: specialinstrction) => {
 	const handlechange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
 		const newvalue = event.target.value;
 		inputchange(newvalue);
