@@ -10,7 +10,7 @@ interface FileUploadProps {
 
 export default function FileUpload({
 	onFileSelect,
-	accept = ".xlsx,.xls",
+	accept: _accept = ".xlsx,.xls",
 	maxSize = 10 * 1024 * 1024, // 10MB default
 }: FileUploadProps = {}) {
 	const [selectedFile, setSelectedFile] = useState<File | null>(null);

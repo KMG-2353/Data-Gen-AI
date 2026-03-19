@@ -12,6 +12,7 @@ import {
 	SelectValue,
 } from "./components/ui/select";
 import FileUpload from "./components/ui/upload.tsx";
+import { apiConfig } from "./config/api";
 
 function App() {
 	const [headersBySheet, setHeadersBySheet] = useState<
@@ -34,7 +35,7 @@ function App() {
 			const formData = new FormData();
 			formData.append("file", file);
 
-			const response = await fetch("/api/upload", {
+			const response = await fetch(apiConfig.endpoints.upload, {
 				method: "POST",
 				body: formData,
 			});
@@ -62,7 +63,7 @@ function App() {
 
 		setIsGenerating(true);
 		try {
-			const response = await fetch("/api/generate", {
+			const response = await fetch(apiConfig.endpoints.generate, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({
@@ -87,7 +88,7 @@ function App() {
 	const handleDownload = async () => {
 		if (!sessionId) return;
 
-		const response = await fetch(`/api/download/${sessionId}`);
+		const response = await fetch(apiConfig.endpoints.download(sessionId));
 		const blob = await response.blob();
 
 		const url = URL.createObjectURL(blob);

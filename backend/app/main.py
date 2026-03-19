@@ -7,16 +7,22 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from llm_service import generate_test_data
+from app.llm_service import generate_test_data
 
 load_dotenv()
 
 app = FastAPI()
 
-# Configure CORS
+# Configure CORS with environment-aware origins
 origins = [
-    "http://localhost:5173",  # Allow your Vite app's origin
+    "http://localhost:5173",  # Development
+    "https://data-gen-ai-1.onrender.com",  # Production frontend
 ]
+
+# Add additional frontend URL from environment if specified
+frontend_url = os.getenv("FRONTEND_URL")
+if frontend_url and frontend_url not in origins:
+    origins.append(frontend_url)
 
 app.add_middleware(
     CORSMiddleware,

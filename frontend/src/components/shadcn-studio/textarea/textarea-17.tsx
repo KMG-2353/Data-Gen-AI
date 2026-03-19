@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId } from "react";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 
@@ -6,7 +6,10 @@ type specialinstrction = {
 	value: string;
 	inputchange: (newvalue: string) => void;
 };
-const TextareaAutoGrowDemo = ({ value, inputchange }: specialinstrction) => {
+const TextareaAutoGrowDemo = ({
+	value: _value,
+	inputchange,
+}: specialinstrction) => {
 	const handlechange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
 		const newvalue = event.target.value;
 		inputchange(newvalue);
