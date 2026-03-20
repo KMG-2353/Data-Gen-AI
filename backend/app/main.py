@@ -5,9 +5,12 @@ from openpyxl import load_workbook, Workbook
 from io import BytesIO
 import uuid
 import os
+import json
+import asyncio
 from dotenv import load_dotenv
+from typing import Any
 
-from app.llm_service import generate_test_data
+from app.llm_service import generate_test_data, analyze_sheet_patterns, refine_rule
 
 load_dotenv()
 
@@ -39,114 +42,323 @@ sessions = {}
 # def read_hello():
 #     return {"message": "Test123"}
 
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint for warming up the server."""
+    return {"status": "ok"}
+
+
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
         # Validate file type
         if not file.filename.endswith(('.xlsx', '.xls')):
             raise HTTPException(status_code=400, detail="Only Excel files (.xlsx, .xls) are allowed")
-        
+
         # Read file content
         content = await file.read()
-        
-        # Load workbook from bytes
-        workbook = load_workbook(BytesIO(content), read_only=True)
-        
-        # Extract headers from first row of all sheets
-        headers_by_sheet = {}       # original names (for display & Excel output)
-        unique_headers_by_sheet = {} # deduplicated names (for LLM)
+
+        # Load workbook from bytes (read_only + data_only for faster parsing)
+        workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+
+        # Extract headers AND sample data from all sheets
+        sheets_data: dict[str, dict[str, Any]] = {}
+
         for sheet in workbook.worksheets:
-            original_headers = []
-            for cell in sheet[1]:
-                if cell.value:
-                    original_headers.append(str(cell.value))
+            # Get all rows as list for easier access
+            rows = list(sheet.iter_rows(values_only=True))
+            if not rows:
+                continue
+
+            # First row is headers
+            original_headers = [str(cell) if cell else "" for cell in rows[0]]
+            original_headers = [h for h in original_headers if h]  # Remove empty
+
             if not original_headers:
                 continue
-            
+
             # Make duplicate headers unique by appending column position
-            seen = {}
-            unique_headers = []
+            seen: dict[str, int] = {}
+            unique_headers: list[str] = []
             for idx, h in enumerate(original_headers):
                 if original_headers.count(h) > 1:
-                    # Track occurrence number
                     seen[h] = seen.get(h, 0) + 1
                     unique_headers.append(f"{h} (Col {idx + 1})")
                 else:
                     unique_headers.append(h)
-            
-            headers_by_sheet[sheet.title] = original_headers
-            unique_headers_by_sheet[sheet.title] = unique_headers
-        
+
+            # Extract sample data (up to 10 rows) for each column
+            samples: dict[str, list[Any]] = {h: [] for h in unique_headers}
+            data_rows = rows[1:11]  # Skip header, take up to 10 rows
+
+            for row in data_rows:
+                for col_idx, unique_header in enumerate(unique_headers):
+                    if col_idx < len(row) and row[col_idx] is not None:
+                        samples[unique_header].append(row[col_idx])
+
+            sheets_data[sheet.title] = {
+                "original_headers": original_headers,
+                "unique_headers": unique_headers,
+                "samples": samples,
+                "row_count": len(rows) - 1  # Exclude header row
+            }
+
         workbook.close()
-        
-        if not headers_by_sheet:
-            raise HTTPException(status_code=400, detail="No headers found in any sheet")
-        
+
+        if not sheets_data:
+            raise HTTPException(status_code=400, detail="No data found in any sheet")
+
         # Generate session ID
         session_id = str(uuid.uuid4())
-        
-        # Store session data
+
+        # Store session data with new structure
         sessions[session_id] = {
-            "headers_by_sheet": headers_by_sheet,
-            "unique_headers_by_sheet": unique_headers_by_sheet,
+            "sheets_data": sheets_data,
+            "rule_sets": {},  # Will be populated by /api/analyze
             "filename": file.filename
         }
-        
+
+        # Build response with sample preview
+        sheets_preview = []
+        for sheet_name, data in sheets_data.items():
+            sheets_preview.append({
+                "sheet_name": sheet_name,
+                "headers": data["original_headers"],
+                "unique_headers": data["unique_headers"],
+                "sample_count": min(10, data["row_count"]),
+                "total_rows": data["row_count"]
+            })
+
         return {
             "session_id": session_id,
-            "headers_by_sheet": headers_by_sheet,
-            "sheet_names": list(headers_by_sheet.keys()),
-            "sheet_count": len(headers_by_sheet),
+            "sheets": sheets_preview,
+            "sheet_names": list(sheets_data.keys()),
+            "sheet_count": len(sheets_data),
             "filename": file.filename
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
-@app.post("/api/generate")
-async def generate_data(request: dict):
-    """Generate test data using LLM for all sheets"""
+
+async def analyze_sheets_stream(session_id: str, sheets_to_analyze: list[str]):
+    """Generator for SSE events during pattern analysis."""
+    session = sessions[session_id]
+    sheets_data = session["sheets_data"]
+    total_sheets = len(sheets_to_analyze)
+
+    for idx, sheet_name in enumerate(sheets_to_analyze):
+        # Send sheet_start event
+        yield f"data: {json.dumps({'event': 'sheet_start', 'sheet_name': sheet_name, 'progress': idx / total_sheets, 'message': f'Analyzing {sheet_name}...'})}\n\n"
+
+        try:
+            sheet_info = sheets_data[sheet_name]
+
+            print(f"Analyzing sheet '{sheet_name}' with {len(sheet_info['unique_headers'])} headers")
+
+            # Call LLM to analyze patterns
+            rule_set = analyze_sheet_patterns(
+                sheet_name=sheet_name,
+                headers=sheet_info["unique_headers"],
+                samples=sheet_info["samples"]
+            )
+
+            # Store rules in session
+            session["rule_sets"][sheet_name] = rule_set
+
+            print(f"Successfully analyzed sheet '{sheet_name}' - found {len(rule_set.get('rules', []))} rules")
+
+            # Send sheet_complete event
+            yield f"data: {json.dumps({'event': 'sheet_complete', 'sheet_name': sheet_name, 'progress': (idx + 1) / total_sheets, 'rules': rule_set})}\n\n"
+
+        except Exception as e:
+            import traceback
+            error_msg = str(e)
+            print(f"Error analyzing sheet '{sheet_name}': {error_msg}")
+            print(traceback.format_exc())
+            yield f"data: {json.dumps({'event': 'error', 'sheet_name': sheet_name, 'message': error_msg})}\n\n"
+
+        # Small delay to allow frontend to process
+        await asyncio.sleep(0.1)
+
+    # Send complete event
+    yield f"data: {json.dumps({'event': 'complete', 'progress': 1.0, 'message': 'Analysis complete'})}\n\n"
+
+
+@app.post("/api/analyze")
+async def analyze_patterns(request: dict):
+    """Analyze patterns in uploaded data - returns SSE stream."""
     session_id = request.get("session_id")
-    row_count = request.get("row_count", 10)
-    special_instructions=request.get("special_inst","")
+    sheets_to_analyze = request.get("sheets_to_analyze")
+
+    if not session_id or session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    sheets = sheets_to_analyze or list(session["sheets_data"].keys())
+
+    return StreamingResponse(
+        analyze_sheets_stream(session_id, sheets),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.get("/api/rules/{session_id}")
+async def get_rules(session_id: str):
+    """Get current rule sets for a session."""
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
-    
-    unique_headers_by_sheet = sessions[session_id]["unique_headers_by_sheet"]
-    original_headers_by_sheet = sessions[session_id]["headers_by_sheet"]
-    
+
+    session = sessions[session_id]
+    return {
+        "session_id": session_id,
+        "rule_sets": session.get("rule_sets", {}),
+        "sheets": list(session["sheets_data"].keys())
+    }
+
+
+@app.put("/api/rules/update")
+async def update_rule(request: dict):
+    """Manually update a rule for a column."""
+    session_id = request.get("session_id")
+    sheet_name = request.get("sheet_name")
+    column_name = request.get("column_name")
+    updated_rule = request.get("updated_rule")
+
+    if not session_id or session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    if sheet_name not in session.get("rule_sets", {}):
+        raise HTTPException(status_code=404, detail="Sheet rules not found")
+
+    # Find and update the rule
+    rules = session["rule_sets"][sheet_name]["rules"]
+    for i, rule in enumerate(rules):
+        if rule["column_name"] == column_name:
+            updated_rule["user_modified"] = True
+            rules[i] = updated_rule
+            return {
+                "success": True,
+                "sheet_name": sheet_name,
+                "column_name": column_name,
+                "updated_rule": updated_rule
+            }
+
+    raise HTTPException(status_code=404, detail="Column rule not found")
+
+
+@app.post("/api/rules/reprompt")
+async def reprompt_rule(request: dict):
+    """Use LLM to refine a rule based on user feedback."""
+    session_id = request.get("session_id")
+    sheet_name = request.get("sheet_name")
+    column_name = request.get("column_name")
+    user_feedback = request.get("user_feedback")
+
+    if not session_id or session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+
+    if sheet_name not in session.get("rule_sets", {}):
+        raise HTTPException(status_code=404, detail="Sheet rules not found")
+
+    # Find the current rule
+    rules = session["rule_sets"][sheet_name]["rules"]
+    current_rule = None
+    rule_index = -1
+
+    for i, rule in enumerate(rules):
+        if rule["column_name"] == column_name:
+            current_rule = rule
+            rule_index = i
+            break
+
+    if current_rule is None:
+        raise HTTPException(status_code=404, detail="Column rule not found")
+
+    # Get sample data for context
+    samples = session["sheets_data"][sheet_name]["samples"].get(column_name, [])
+
     try:
-        # Generate data for ALL sheets sequentially, passing previous data for consistency
+        # Call LLM to refine the rule
+        new_rule = refine_rule(
+            current_rule=current_rule,
+            user_feedback=user_feedback,
+            sample_values=samples
+        )
+
+        new_rule["user_modified"] = True
+
+        # Update the rule in session
+        rules[rule_index] = new_rule
+
+        return {
+            "session_id": session_id,
+            "sheet_name": sheet_name,
+            "column_name": column_name,
+            "old_rule": current_rule,
+            "new_rule": new_rule
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error refining rule: {str(e)}")
+
+@app.post("/api/generate")
+async def generate_data(request: dict):
+    """Generate test data using LLM based on verified rules."""
+    session_id = request.get("session_id")
+    row_count = request.get("row_count", 10)
+    special_instructions = request.get("special_inst", "")
+    skip_rules = request.get("skip_rules", False)  # If True, generate without rules (legacy mode)
+
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = sessions[session_id]
+    sheets_data = session["sheets_data"]
+    rule_sets = session.get("rule_sets", {})
+
+    try:
         generated_data_by_sheet = {}
         previous_sheets_data = {}
-        
-        for sheet_name, unique_headers in unique_headers_by_sheet.items():
-            original_headers = original_headers_by_sheet[sheet_name]
-            print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {unique_headers}")
-            
-            # Send unique (deduplicated) headers to LLM
+
+        for sheet_name, sheet_info in sheets_data.items():
+            unique_headers = sheet_info["unique_headers"]
+            original_headers = sheet_info["original_headers"]
+
+            print(f"Generating {row_count} rows for sheet '{sheet_name}'")
+
+            # Get rules for this sheet if available
+            sheet_rules = rule_sets.get(sheet_name) if not skip_rules else None
+
             data = generate_test_data(
                 headers=unique_headers,
                 row_count=row_count,
                 special_instruction=special_instructions,
                 sheet_name=sheet_name,
-                previous_sheets_data=previous_sheets_data if previous_sheets_data else None
+                previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
+                rules=sheet_rules  # Pass verified rules
             )
-            
+
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,
                 "unique_headers": unique_headers,
                 "data": data
             }
-            
-            # Add this sheet's data to context for subsequent sheets
+
             previous_sheets_data[sheet_name] = data
-            
             print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
-        
+
         # Store generated data in session
-        sessions[session_id]["generated_data_by_sheet"] = generated_data_by_sheet
-        
+        session["generated_data_by_sheet"] = generated_data_by_sheet
+
         return {
             "session_id": session_id,
             "sheets_generated": list(generated_data_by_sheet.keys()),
