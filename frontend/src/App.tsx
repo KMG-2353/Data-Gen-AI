@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import TextareaAutoGrowDemo from "./components/shadcn-studio/textarea/textarea-17.tsx";
 import { Button } from "./components/ui/button.tsx";
 import { Input } from "./components/ui/input";
@@ -53,6 +53,10 @@ function App() {
 	const [testCases, setTestCases] = useState(5);
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
 
+	// Auto-mode tracking
+	const isAutoMode = useRef(false);
+	const autoModeTriggered = useRef(false);
+
 	// Warm up server on mount
 	useEffect(() => {
 		warmUpServer();
@@ -69,6 +73,7 @@ function App() {
 			progress: 0,
 			status: "idle",
 		});
+		autoModeTriggered.current = false;
 
 		try {
 			const formData = new FormData();
@@ -86,6 +91,11 @@ function App() {
 			setSheetsData(data.sheets || []);
 			setSheetNames(data.sheet_names);
 			setSessionId(data.session_id);
+
+			// If auto-mode (toggle OFF), trigger analysis immediately
+			if (!verifyRulesBeforeGeneration) {
+				isAutoMode.current = true;
+			}
 		} catch (error) {
 			console.error("Upload error:", error);
 			alert("Failed to upload file. Please try again.");
@@ -188,6 +198,51 @@ function App() {
 			}));
 		}
 	}, [sessionId, sheetNames.length]);
+
+	// Auto-trigger analysis when file is uploaded and toggle is OFF
+	useEffect(() => {
+		if (
+			!verifyRulesBeforeGeneration &&
+			sessionId &&
+			!isUploading &&
+			analysisProgress.status === "idle" &&
+			isAutoMode.current &&
+			!autoModeTriggered.current
+		) {
+			autoModeTriggered.current = true;
+			handleAnalyzePatterns();
+		}
+	}, [
+		verifyRulesBeforeGeneration,
+		sessionId,
+		isUploading,
+		analysisProgress.status,
+		handleAnalyzePatterns,
+	]);
+
+	// Auto-trigger generation after analysis completes when toggle is OFF
+	useEffect(() => {
+		if (
+			!verifyRulesBeforeGeneration &&
+			sessionId &&
+			analysisProgress.status === "complete" &&
+			!isGenerating &&
+			!generatedSheets &&
+			isAutoMode.current
+		) {
+			// Small delay to ensure state is settled
+			const timer = setTimeout(() => {
+				handleGenerateTestCases();
+			}, 500);
+			return () => clearTimeout(timer);
+		}
+	}, [
+		verifyRulesBeforeGeneration,
+		sessionId,
+		analysisProgress.status,
+		isGenerating,
+		generatedSheets,
+	]);
 
 	const handleUpdateRule = async (
 		sheetName: string,
@@ -292,7 +347,7 @@ function App() {
 					session_id: sessionId,
 					row_count: testCases,
 					special_inst: specialInstruction,
-					skip_rules: !verifyRulesBeforeGeneration,
+					skip_rules: false, // Always use rules now since we always analyze
 				}),
 			});
 
@@ -300,6 +355,7 @@ function App() {
 
 			const data = await response.json();
 			setGeneratedSheets(data.sheets_generated);
+			isAutoMode.current = false; // Reset auto mode after generation
 		} catch (error) {
 			console.error("Generation error:", error);
 			alert("Failed to generate test cases. Please try again.");
@@ -325,6 +381,9 @@ function App() {
 	};
 
 	const hasRules = Object.keys(ruleSets).length > 0;
+	const isAutoProcessing =
+		!verifyRulesBeforeGeneration &&
+		(analysisProgress.status === "analyzing" || isGenerating);
 
 	return (
 		<div className="flex min-h-screen m-auto w-full max-w-3xl justify-start items-center flex-col gap-5 p-8">
@@ -337,13 +396,16 @@ function App() {
 						Verify rules before generation
 					</Label>
 					<span className="text-xs text-gray-500">
-						Analyze patterns and review rules before generating data
+						{verifyRulesBeforeGeneration
+							? "Analyze patterns and review rules before generating data"
+							: "Auto-analyze and generate without manual review"}
 					</span>
 				</div>
 				<Switch
 					id="verify-toggle"
 					checked={verifyRulesBeforeGeneration}
 					onCheckedChange={setVerifyRulesBeforeGeneration}
+					disabled={isAutoProcessing}
 				/>
 			</div>
 
@@ -390,7 +452,7 @@ function App() {
 				</div>
 			)}
 
-			{/* Analyze Patterns Button */}
+			{/* Analyze Patterns Button - Only show when toggle is ON */}
 			{verifyRulesBeforeGeneration && sessionId && !hasRules && (
 				<Button
 					onClick={handleAnalyzePatterns}
@@ -406,12 +468,24 @@ function App() {
 				</Button>
 			)}
 
-			{/* Analysis Progress */}
+			{/* Analysis Progress - Show in both modes */}
 			{analysisProgress.status !== "idle" && (
 				<AnalysisProgress progress={analysisProgress} />
 			)}
 
-			{/* Rules Panel */}
+			{/* Auto-mode Generation Status */}
+			{!verifyRulesBeforeGeneration && isGenerating && (
+				<div className="w-full p-4 bg-blue-50 rounded-lg">
+					<p className="text-sm text-blue-700 font-medium">
+						Generating test data automatically...
+					</p>
+					<p className="text-xs text-blue-600 mt-1">
+						This may take a moment depending on the number of sheets.
+					</p>
+				</div>
+			)}
+
+			{/* Rules Panel - Only show when toggle is ON */}
 			{verifyRulesBeforeGeneration && hasRules && (
 				<div className="w-full flex flex-col gap-3">
 					<h2 className="text-sm font-medium">
@@ -440,6 +514,7 @@ function App() {
 					onChange={(e) => setTestCases(Number(e.target.value))}
 					min={1}
 					max={500}
+					disabled={isAutoProcessing}
 				/>
 				<div className="w-full flex gap-3">
 					<Select
@@ -448,6 +523,7 @@ function App() {
 							setLineOfBusiness(val);
 							setCoverage("");
 						}}
+						disabled={isAutoProcessing}
 					>
 						<SelectTrigger className="w-full max-w-48">
 							<SelectValue placeholder="Select LOB" />
@@ -462,7 +538,7 @@ function App() {
 					</Select>
 
 					{lineOfBusiness && (
-						<Select value={coverage} onValueChange={setCoverage}>
+						<Select value={coverage} onValueChange={setCoverage} disabled={isAutoProcessing}>
 							{lineOfBusiness === "Monoline" ? (
 								<SelectTrigger className="w-full max-w-56">
 									<SelectValue placeholder="Select" />
@@ -509,19 +585,21 @@ function App() {
 				/>
 			</div>
 
-			{/* Generate Button */}
-			<Button
-				onClick={handleGenerateTestCases}
-				disabled={
-					!sessionId ||
-					isUploading ||
-					isGenerating ||
-					(verifyRulesBeforeGeneration && !hasRules)
-				}
-				className="w-full"
-			>
-				{isGenerating ? "Generating..." : "Generate Test Data"}
-			</Button>
+			{/* Generate Button - Only show when toggle is ON */}
+			{verifyRulesBeforeGeneration && (
+				<Button
+					onClick={handleGenerateTestCases}
+					disabled={
+						!sessionId ||
+						isUploading ||
+						isGenerating ||
+						!hasRules
+					}
+					className="w-full"
+				>
+					{isGenerating ? "Generating..." : "Generate Test Data"}
+				</Button>
+			)}
 
 			{/* Download Section */}
 			{generatedSheets && (

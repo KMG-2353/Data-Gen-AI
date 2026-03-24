@@ -1,8 +1,15 @@
-from openai import OpenAI
+import anthropic
 import json
 import os
 import time
+from datetime import datetime, timedelta
 from typing import Any
+
+from .pattern_detector import analyze_sheet_patterns_deterministic
+
+
+# Default model - Claude Sonnet 4 is excellent for pattern recognition
+DEFAULT_MODEL = "claude-sonnet-4-20250514"
 
 
 def _clean_response_text(text: str) -> str:
@@ -37,12 +44,12 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     raise ValueError(f"Model output is not a JSON array or wrapped array. Got: {type(parsed)}")
 
 
-def configure_openai() -> OpenAI:
-    """Configure OpenAI client with API key from environment."""
-    key = os.getenv("OPENAI_API_KEY")
+def configure_anthropic() -> anthropic.Anthropic:
+    """Configure Anthropic client with API key from environment."""
+    key = os.getenv("CLAUDE_API_KEY")
     if not key:
-        raise ValueError("OPENAI_API_KEY not found")
-    return OpenAI(api_key=key)
+        raise ValueError("CLAUDE_API_KEY not found in environment")
+    return anthropic.Anthropic(api_key=key)
 
 
 def analyze_sheet_patterns(
@@ -50,100 +57,84 @@ def analyze_sheet_patterns(
     headers: list[str],
     samples: dict[str, list[Any]]
 ) -> dict[str, Any]:
-    """Analyze sample data to extract patterns and rules for each column."""
-    client = configure_openai()
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
+    """
+    Analyze sample data to extract patterns and rules for each column.
 
-    # Build sample data description
-    columns_data = []
-    for header in headers:
-        column_samples = samples.get(header, [])
-        # Convert to strings for display
-        sample_strs = [str(v) for v in column_samples[:10]]
-        columns_data.append({
-            "column_name": header,
-            "sample_values": sample_strs,
-            "sample_count": len(column_samples)
-        })
+    Uses a HYBRID approach:
+    1. First, run deterministic pattern detection (fast, accurate for known patterns)
+    2. For low-confidence rules, optionally enhance with LLM analysis
+    """
+    # Step 1: Deterministic pattern detection
+    deterministic_result = analyze_sheet_patterns_deterministic(sheet_name, headers, samples)
 
-    prompt = f"""Analyze the following sample data from sheet "{sheet_name}" and extract generation rules.
+    # Step 2: Check if any rules need LLM enhancement (confidence < 0.7)
+    low_confidence_rules = [
+        r for r in deterministic_result["rules"]
+        if r.get("confidence", 1.0) < 0.7 and r.get("rule_type") == "text"
+    ]
 
-SAMPLE DATA:
-{json.dumps(columns_data, indent=2)}
+    # If all rules have high confidence, return deterministic results
+    if not low_confidence_rules:
+        return deterministic_result
+
+    # Step 3: Use LLM only for low-confidence columns
+    try:
+        client = configure_anthropic()
+        model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+
+        # Only send low-confidence columns to LLM
+        columns_for_llm = []
+        for rule in low_confidence_rules:
+            col_name = rule["column_name"]
+            col_samples = samples.get(col_name, [])
+            sample_strs = [str(v) for v in col_samples[:10] if v is not None]
+            columns_for_llm.append({
+                "column_name": col_name,
+                "sample_values": sample_strs,
+                "current_detection": rule.get("description", "Unknown")
+            })
+
+        prompt = f"""Analyze ONLY these columns that need pattern clarification:
+
+{json.dumps(columns_for_llm, indent=2)}
 
 For each column, determine:
-1. rule_type: One of "format", "range", "enum", "pattern", "sequence", "text"
-   - "format": Data follows a specific format (phone, SSN, date, email, etc.)
-   - "range": Numeric or date range
-   - "enum": Fixed list of values
-   - "pattern": Custom regex pattern
-   - "sequence": Sequential/incrementing values (IDs, policy numbers)
-   - "text": Free-form text
+1. rule_type: One of "format", "range", "enum", "pattern", "text"
+2. description: Human-readable rule description
+3. constraints: Applicable constraints as JSON
 
-2. description: Human-readable rule description (e.g., "US Phone: (XXX) XXX-XXXX")
+Return JSON:
+{{"rules": [{{"column_name": "...", "rule_type": "...", "description": "...", "constraints": {{}}}}]}}"""
 
-3. pattern: Regex pattern if the data follows a specific format (optional)
+        response = client.messages.create(
+            model=model_name,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+            system="You are a data analyst. Analyze only ambiguous columns. Return valid JSON only.",
+        )
 
-4. constraints: JSON object with applicable constraints:
-   - For "format": {{"format_example": "..."}}
-   - For "range": {{"min": X, "max": Y}}
-   - For "enum": {{"values": ["A", "B", "C"]}}
-   - For "date": {{"format": "MM/DD/YYYY", "range_start": "...", "range_end": "..."}}
-   - For "sequence": {{"prefix": "POL-", "start": 10001, "step": 1}}
+        text = "".join(block.text for block in response.content if block.type == "text")
 
-5. examples: 3 representative examples (can be from the data or generated)
+        if text.strip():
+            llm_result = json.loads(_clean_response_text(text))
 
-6. confidence: Your confidence in this rule (0.0 to 1.0)
+            # Merge LLM results into deterministic results
+            llm_rules_map = {r["column_name"]: r for r in llm_result.get("rules", [])}
 
-7. llm_reasoning: Brief explanation of why you chose this rule
+            for i, rule in enumerate(deterministic_result["rules"]):
+                if rule["column_name"] in llm_rules_map:
+                    llm_rule = llm_rules_map[rule["column_name"]]
+                    deterministic_result["rules"][i].update({
+                        "rule_type": llm_rule.get("rule_type", rule["rule_type"]),
+                        "description": llm_rule.get("description", rule["description"]),
+                        "constraints": llm_rule.get("constraints", rule.get("constraints", {})),
+                        "detection_method": "hybrid"
+                    })
+    except Exception as e:
+        # If LLM fails, just use deterministic results
+        print(f"LLM enhancement failed, using deterministic results: {e}")
 
-Also identify any CROSS-COLUMN RULES such as:
-- Date relationships (effective_date < expiration_date)
-- Calculated fields (total = quantity * price)
-- Conditional values
-
-Return a JSON object with this structure:
-{{
-  "rules": [
-    {{
-      "column_name": "...",
-      "rule_type": "...",
-      "description": "...",
-      "pattern": null,
-      "constraints": {{}},
-      "examples": [],
-      "confidence": 0.95,
-      "llm_reasoning": "..."
-    }}
-  ],
-  "cross_column_rules": [
-    "effective_date must be before expiration_date"
-  ]
-}}"""
-
-    response = client.chat.completions.create(
-        model=model_name,
-        temperature=0.3,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": "You are an expert data analyst. Analyze sample data to extract precise patterns and rules. Return valid JSON only."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            },
-        ],
-    )
-
-    content = response.choices[0].message.content
-    text: str = content if isinstance(content, str) else ""
-    if not text.strip():
-        raise ValueError("OpenAI returned an empty response")
-
-    result = json.loads(_clean_response_text(text))
-    return result
+    return deterministic_result
 
 
 def refine_rule(
@@ -152,8 +143,8 @@ def refine_rule(
     sample_values: list[Any]
 ) -> dict[str, Any]:
     """Refine a rule based on user feedback using LLM."""
-    client = configure_openai()
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
+    client = configure_anthropic()
+    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
 
     sample_strs = [str(v) for v in sample_values[:10]]
 
@@ -186,28 +177,132 @@ Return a JSON object with the SAME structure as the input rule:
   "llm_reasoning": "Explanation of what changed based on feedback"
 }}"""
 
-    response = client.chat.completions.create(
+    response = client.messages.create(
         model=model_name,
-        temperature=0.3,
-        response_format={"type": "json_object"},
+        max_tokens=2048,
         messages=[
-            {
-                "role": "system",
-                "content": "You are a data rule refinement assistant. Update rules based on user feedback. Return valid JSON only."
-            },
             {
                 "role": "user",
                 "content": prompt
             },
         ],
+        system="You are a data rule refinement assistant. Update rules based on user feedback. Return valid JSON only.",
     )
 
-    content = response.choices[0].message.content
-    text: str = content if isinstance(content, str) else ""
+    # Extract text from response
+    text = ""
+    for block in response.content:
+        if block.type == "text":
+            text += block.text
+
     if not text.strip():
-        raise ValueError("OpenAI returned an empty response")
+        raise ValueError("Claude returned an empty response")
 
     return json.loads(_clean_response_text(text))
+
+
+def _generate_deterministic_value(rule: dict[str, Any], row_index: int, base_date: datetime | None = None) -> Any:
+    """
+    Generate a value deterministically based on the rule type.
+    Returns None if the value should be generated by LLM instead.
+    """
+    rule_type = rule.get("rule_type", "text")
+    constraints = rule.get("constraints", {})
+
+    if rule_type == "empty":
+        return None  # Column should be empty
+
+    if rule_type == "sequence":
+        seq_type = constraints.get("sequence_type", "integer")
+        start = constraints.get("start", 1)
+        step = constraints.get("step", 1)
+        prefix = constraints.get("prefix", "")
+        suffix = constraints.get("suffix", "")
+
+        if seq_type == "prefixed" or prefix:
+            # Preserve leading zeros if present in original
+            num_digits = constraints.get("num_digits", len(str(start)))
+            value = start + (row_index * step)
+            return f"{prefix}{str(value).zfill(num_digits)}{suffix}"
+        elif seq_type == "date":
+            if base_date:
+                step_days = constraints.get("step_days", step)
+                # Return datetime object - will be formatted later
+                return base_date + timedelta(days=row_index * step_days)
+            return None
+        else:
+            return start + (row_index * step)
+
+    if rule_type == "enum":
+        values = constraints.get("values", [])
+        if constraints.get("constant") and values:
+            return values[0]  # Always return the constant value
+        elif values:
+            # Cycle through values or pick based on index
+            return values[row_index % len(values)]
+
+    if rule_type == "date":
+        # Generate date values - return datetime object for later formatting
+        if base_date:
+            step_days = constraints.get("step_days", 1)
+            return base_date + timedelta(days=row_index * step_days)
+
+    # For other types, return None to indicate LLM should generate
+    return None
+
+
+def _generate_row_deterministic(
+    headers: list[str],
+    rules: list[dict[str, Any]],
+    row_index: int,
+    cross_column_rules: list[dict[str, Any]] | None = None
+) -> tuple[dict[str, Any], list[str]]:
+    """
+    Generate as much of a row as possible deterministically.
+    Returns (partial_row, columns_needing_llm)
+    """
+    rules_map = {r["column_name"]: r for r in rules}
+    row = {}
+    need_llm = []
+
+    # First pass: generate independent deterministic values
+    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    for header in headers:
+        rule = rules_map.get(header, {"rule_type": "text"})
+        value = _generate_deterministic_value(rule, row_index, base_date)
+
+        if value is not None:
+            row[header] = value
+        elif rule.get("rule_type") != "empty":
+            need_llm.append(header)
+
+    # Second pass: handle cross-column relationships
+    if cross_column_rules:
+        for cross_rule in cross_column_rules:
+            if cross_rule.get("relationship") == "exactly_one_year_apart":
+                cols = cross_rule.get("columns", [])
+                if len(cols) == 2 and cols[0] in row:
+                    start_date = row[cols[0]]
+                    if isinstance(start_date, datetime):
+                        # Add exactly one year
+                        try:
+                            row[cols[1]] = start_date.replace(year=start_date.year + 1)
+                        except ValueError:
+                            # Handle Feb 29 -> Feb 28
+                            row[cols[1]] = start_date.replace(year=start_date.year + 1, day=28)
+                        if cols[1] in need_llm:
+                            need_llm.remove(cols[1])
+
+            elif cross_rule.get("type") == "equal_values":
+                cols = cross_rule.get("columns", [])
+                if len(cols) == 2 and cols[0] in row and cols[1] not in row:
+                    row[cols[1]] = row[cols[0]]
+                    if cols[1] in need_llm:
+                        need_llm.remove(cols[1])
+
+    return row, need_llm
+
 
 def generate_test_data(
     headers: list[str],
@@ -216,170 +311,318 @@ def generate_test_data(
     sheet_name: str = "",
     previous_sheets_data: dict[str, Any] | None = None,
     rules: dict[str, Any] | None = None,
+    samples: dict[str, list[Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Generate test data using OpenAI, optionally following verified rules."""
+    """
+    Generate test data using HYBRID approach:
+    1. Generate deterministic values (sequences, enums, dates, empty) without LLM
+    2. Use LLM only for text/complex fields that can't be generated deterministically
+    """
 
-    client = configure_openai()
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o")
+    # If we have rules, use hybrid generation
+    if rules and "rules" in rules:
+        return _generate_hybrid(
+            headers=headers,
+            row_count=row_count,
+            special_instruction=special_instruction,
+            sheet_name=sheet_name,
+            previous_sheets_data=previous_sheets_data,
+            rules=rules,
+            samples=samples
+        )
 
-    # Build context from previously generated sheets
+    # Legacy mode - full LLM generation
+    return _generate_full_llm(
+        headers=headers,
+        row_count=row_count,
+        special_instruction=special_instruction,
+        sheet_name=sheet_name,
+        previous_sheets_data=previous_sheets_data,
+        samples=samples
+    )
+
+
+def _generate_hybrid(
+    headers: list[str],
+    row_count: int,
+    special_instruction: str,
+    sheet_name: str,
+    previous_sheets_data: dict[str, Any] | None,
+    rules: dict[str, Any],
+    samples: dict[str, list[Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Hybrid generation: deterministic where possible, LLM for the rest."""
+
+    rules_list = rules.get("rules", [])
+    cross_rules = rules.get("cross_column_rules_detailed", [])
+
+    # Build a map of column -> date format from rules
+    date_format_map = {}
+    for rule in rules_list:
+        col_name = rule.get("column_name")
+        constraints = rule.get("constraints", {})
+        if rule.get("rule_type") == "date":
+            # Check format in constraints
+            fmt = constraints.get("output_format", constraints.get("format", "date"))
+            date_format_map[col_name] = fmt
+
+    # Step 1: Generate deterministic parts for all rows
+    all_rows = []
+    all_need_llm = set()
+
+    for row_idx in range(row_count):
+        partial_row, need_llm = _generate_row_deterministic(
+            headers, rules_list, row_idx, cross_rules
+        )
+        all_rows.append(partial_row)
+        all_need_llm.update(need_llm)
+
+    # Step 2: If some columns need LLM, generate them
+    if all_need_llm:
+        llm_columns = list(all_need_llm)
+        llm_data = _generate_llm_columns(
+            columns=llm_columns,
+            row_count=row_count,
+            rules_list=rules_list,
+            special_instruction=special_instruction,
+            sheet_name=sheet_name,
+            previous_sheets_data=previous_sheets_data,
+            existing_rows=all_rows,
+            samples=samples
+        )
+
+        # Merge LLM data into rows
+        for row_idx, row in enumerate(all_rows):
+            if row_idx < len(llm_data):
+                for col in llm_columns:
+                    if col in llm_data[row_idx]:
+                        row[col] = llm_data[row_idx][col]
+
+    # Step 3: Ensure all headers are present and format dates correctly
+    normalized = []
+    for row in all_rows:
+        formatted_row = {}
+        for header in headers:
+            value = row.get(header, "")
+            # Format datetime objects based on detected format
+            if isinstance(value, datetime):
+                # Check if this column should be date-only
+                date_fmt = date_format_map.get(header, "date")
+                if date_fmt in ("date", "YYYY-MM-DD") or date_fmt != "datetime":
+                    # Format as date string without time
+                    formatted_row[header] = value.strftime("%Y-%m-%d")
+                else:
+                    # Keep full datetime
+                    formatted_row[header] = value.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                formatted_row[header] = value
+        normalized.append(formatted_row)
+
+    return normalized
+
+
+def _generate_llm_columns(
+    columns: list[str],
+    row_count: int,
+    rules_list: list[dict[str, Any]],
+    special_instruction: str,
+    sheet_name: str,
+    previous_sheets_data: dict[str, Any] | None,
+    existing_rows: list[dict[str, Any]],
+    samples: dict[str, list[Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Use LLM to generate only specific columns following EXACT patterns from samples."""
+
+    client = configure_anthropic()
+    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+
+    # Build rules context with SAMPLE VALUES for each column
+    rules_map = {r["column_name"]: r for r in rules_list}
+    columns_with_samples = []
+
+    for col in columns:
+        col_info = {"column": col}
+
+        # Get the rule
+        if col in rules_map:
+            rule = rules_map[col]
+            col_info["rule"] = rule.get('description', 'Generate similar values')
+
+        # Get ORIGINAL sample values - this is critical for pattern matching
+        if samples and col in samples:
+            sample_values = [str(v) for v in samples[col][:10] if v is not None]
+            col_info["original_samples"] = sample_values
+
+        columns_with_samples.append(col_info)
+
+    # Build context from existing deterministic values
+    existing_context = ""
+    if existing_rows:
+        sample_rows = existing_rows[:3]
+        existing_context = f"""
+ALREADY GENERATED VALUES (stay consistent with these):
+{json.dumps(sample_rows, indent=2, default=str)}
+"""
+
+    # Build context from previous sheets
     previous_context = ""
     if previous_sheets_data:
         previous_context = """
-CRITICAL - CROSS-SHEET DATA CONSISTENCY:
-The following sheets have already been generated. You MUST reuse the SAME values for matching/similar fields across sheets.
-Row 1 in this sheet corresponds to Row 1 in all other sheets (same insured/policy/location).
-
-Fields that MUST stay consistent across sheets include (when the column exists):
-- Names, Addresses, Phone numbers, Email addresses
-- Policy numbers, Account numbers
-- Effective dates, Expiration dates
-- SSN, FEIN, Tax ID
-- Data Set (DS_1, DS_2, etc.) must match row-for-row
-
-Previously generated data:
+CROSS-SHEET CONSISTENCY - Reuse matching field values from:
 """
-        for prev_sheet_name, prev_data in previous_sheets_data.items():
-            previous_context += f"\n--- Sheet: '{prev_sheet_name}' ---\n"
-            previous_context += json.dumps(prev_data, indent=2)
-            previous_context += "\n"
+        for prev_name, prev_data in previous_sheets_data.items():
+            if prev_data:
+                previous_context += f"\n{prev_name}: {json.dumps(prev_data[:2], indent=2, default=str)}\n"
 
-    # Build rules context if rules are provided
-    rules_context = ""
-    if rules and "rules" in rules:
-        rules_context = """
-VERIFIED COLUMN RULES (You MUST follow these exactly):
-"""
-        for rule in rules["rules"]:
-            col_name = rule.get("column_name", "")
-            description = rule.get("description", "")
-            pattern = rule.get("pattern", "")
-            constraints = rule.get("constraints", {})
+    prompt = f"""Generate values for these columns following the EXACT SAME PATTERN as the original samples.
 
-            rules_context += f"\n- {col_name}: {description}"
-            if pattern:
-                rules_context += f" (Pattern: {pattern})"
-            if constraints:
-                rules_context += f" Constraints: {json.dumps(constraints)}"
+Sheet: "{sheet_name}"
+Number of rows needed: {row_count}
 
-        if rules.get("cross_column_rules"):
-            rules_context += "\n\nCROSS-COLUMN RULES:\n"
-            for cross_rule in rules["cross_column_rules"]:
-                rules_context += f"- {cross_rule}\n"
+COLUMNS TO GENERATE WITH THEIR ORIGINAL SAMPLE VALUES:
+{json.dumps(columns_with_samples, indent=2)}
 
-    # Build prompt based on whether rules are provided
-    if rules_context:
-        prompt = f"""You are a test data generator for US insurance applications.
+CRITICAL INSTRUCTIONS:
+1. COPY THE EXACT PATTERN from the original_samples - same format, same style, same length
+2. DO NOT be creative - generate data that looks IDENTICAL in format to the samples
+3. If samples show "Apex Logistics Ltd", generate similar company names like "Summit Industries Corp"
+4. If samples show addresses like "8337 HWY 431 N", generate addresses in the SAME format
+5. Match the EXACT character patterns, spacing, capitalization from samples
+6. For numeric values, stay within the same range as samples
+7. DO NOT add extra formatting or change the style
 
-You are generating data for sheet: "{sheet_name}"
-
-Generate exactly {row_count} rows of test data for the following columns:
-{json.dumps(headers)}
-
-{rules_context}
-
+{existing_context}
 {previous_context}
 
-Additional user instructions: {special_instruction}
+Additional instructions: {special_instruction}
 
-IMPORTANT: Follow the verified rules EXACTLY. These rules were analyzed from sample data and verified by the user.
+Return a JSON object with key "data" containing an array of {row_count} objects.
+Each object should ONLY have keys for: {json.dumps(columns)}
 
-Return a JSON object with a single key "data" whose value is an array of {row_count} objects.
-Each object must use the exact column names as keys.
-No markdown, no explanation, just the JSON object.
+Example: {{"data": [{{"{columns[0]}": "value matching sample pattern"}}, ...]}}"""
 
-Example format:
-{{"data": [{{"column1": "value1", "column2": "value2"}}, ...]}}
-"""
-    else:
-        # Legacy mode - use default US insurance rules
-        prompt = f"""You are a test data generator for US insurance applications.
-
-You are generating data for sheet: "{sheet_name}"
-
-Generate exactly {row_count} rows of realistic test data for the following columns:
-{json.dumps(headers)}
-
-DUPLICATE COLUMN HANDLING:
-Some columns may have a suffix like "(Col X)" — this means the original spreadsheet has multiple columns with the same name.
-You MUST generate DIFFERENT values for each such column.
-Use ALL column names exactly as provided (including suffixes) as JSON keys.
-
-{previous_context}
-
-Make sure you follow these rules and {special_instruction} given by users.
-
-IMPORTANT RULES:
-1. Generate realistic US insurance test data
-2. Use valid US formats:
-   - Phone: (XXX) XXX-XXXX
-   - SSN: XXX-XX-XXXX (use fake but valid format)
-   - ZIP: 5 digits or ZIP+4
-   - State: 2-letter abbreviations (CA, TX, NY, etc.)
-   - Dates: MM/DD/YYYY format
-3. For policy numbers, use realistic formats
-4. For currency amounts, use realistic insurance values
-5. Names should be diverse and realistic
-6. Addresses should be realistic US addresses
-7. The effective date column is of today's date (2026 year) or one day after today
-8. The expiration date column is complete one year gap from the effective date
-9. All Dollar values should be numbers with a dollar sign before them
-10. The Data Set column will always start with DS_1, DS_2, etc.
-
-Return a JSON object with a single key "data" whose value is an array of {row_count} objects.
-Each object must use the exact column names as keys.
-No markdown, no explanation, just the JSON object.
-
-Example format:
-{{"data": [{{"column1": "value1", "column2": "value2"}}, ...]}}
-"""
-
-    # Retry up to 2 times for rate limits only
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
+            response = client.messages.create(
                 model=model_name,
-                temperature=0.8 if rules else 1,  # Lower temp when following rules
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a precise JSON-only data generator for US insurance test datasets. Always return a JSON object with a single key \"data\" containing an array of row objects."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    },
-                ],
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a precise data replicator. Generate data that EXACTLY matches the format and style of the provided samples. Do NOT be creative - copy the pattern precisely. Return valid JSON only.",
             )
 
-            content = response.choices[0].message.content
-            text: str = content if isinstance(content, str) else ""
+            text = "".join(block.text for block in response.content if block.type == "text")
+
             if not text.strip():
-                raise ValueError("OpenAI returned an empty response")
+                raise ValueError("Claude returned an empty response")
 
             data = _parse_json_array(text)
+            return data
 
-            # Ensure all rows have all requested headers
-            normalized: list[dict[str, Any]] = []
-            for row in data:
-                if isinstance(row, dict):
-                    normalized.append({header: row.get(header, "") for header in headers})
-            if not normalized:
-                raise ValueError("Model output did not contain valid row objects")
-
-            return normalized
         except Exception as e:
             error_msg = str(e)
-            if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
+            if "429" in error_msg or "rate" in error_msg.lower():
                 wait_time = 60 * (attempt + 1)
-                print(f"Rate limit hit for sheet '{sheet_name}'. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                print(f"Rate limit for '{sheet_name}'. Waiting {wait_time}s...")
                 time.sleep(wait_time)
                 if attempt == max_retries - 1:
                     raise
             else:
                 raise
 
-    raise RuntimeError("OpenAI response was not received after retries")
+    return [{col: "" for col in columns} for _ in range(row_count)]
 
+
+def _generate_full_llm(
+    headers: list[str],
+    row_count: int,
+    special_instruction: str,
+    sheet_name: str,
+    previous_sheets_data: dict[str, Any] | None,
+    samples: dict[str, list[Any]] | None = None
+) -> list[dict[str, Any]]:
+    """Legacy full LLM generation when no rules are provided."""
+
+    client = configure_anthropic()
+    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+
+    # Build sample context
+    sample_context = ""
+    if samples:
+        sample_data = []
+        for header in headers[:15]:  # Limit to first 15 columns
+            if header in samples:
+                sample_values = [str(v) for v in samples[header][:5] if v is not None]
+                if sample_values:
+                    sample_data.append({"column": header, "samples": sample_values})
+
+        if sample_data:
+            sample_context = f"""
+ORIGINAL SAMPLE DATA - YOU MUST FOLLOW THESE EXACT PATTERNS:
+{json.dumps(sample_data, indent=2)}
+
+CRITICAL: Generate data that looks EXACTLY like these samples - same format, style, and patterns.
+"""
+
+    previous_context = ""
+    if previous_sheets_data:
+        previous_context = """
+CROSS-SHEET CONSISTENCY - Reuse matching field values from:
+"""
+        for prev_name, prev_data in previous_sheets_data.items():
+            previous_context += f"\n--- {prev_name} ---\n{json.dumps(prev_data[:2], indent=2, default=str)}\n"
+
+    prompt = f"""Generate {row_count} rows of data following the EXACT patterns from the samples.
+
+Sheet: "{sheet_name}"
+Columns: {json.dumps(headers)}
+
+{sample_context}
+{previous_context}
+
+Instructions: {special_instruction}
+
+RULES:
+1. COPY the exact format and style from the sample data
+2. DO NOT be creative - replicate the patterns precisely
+3. Match character patterns, spacing, capitalization exactly
+4. Data Set: DS_01, DS_02, etc.
+5. Expiration = Effective + 1 year
+
+Return: {{"data": [{{...}}, ...]}}"""
+
+    max_retries = 2
+    for attempt in range(max_retries):
+        try:
+            response = client.messages.create(
+                model=model_name,
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a precise data replicator. Copy the EXACT format and style from samples. Do NOT add creativity. Return valid JSON only.",
+            )
+
+            text = "".join(block.text for block in response.content if block.type == "text")
+
+            if not text.strip():
+                raise ValueError("Claude returned an empty response")
+
+            data = _parse_json_array(text)
+
+            normalized = []
+            for row in data:
+                if isinstance(row, dict):
+                    normalized.append({h: row.get(h, "") for h in headers})
+            return normalized if normalized else []
+
+        except Exception as e:
+            error_msg = str(e)
+            if "429" in error_msg or "rate" in error_msg.lower():
+                wait_time = 60 * (attempt + 1)
+                print(f"Rate limit for '{sheet_name}'. Waiting {wait_time}s...")
+                time.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    raise
+            else:
+                raise
+
+    raise RuntimeError("Claude response was not received after retries")

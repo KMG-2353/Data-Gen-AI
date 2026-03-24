@@ -344,7 +344,8 @@ async def generate_data(request: dict):
                 special_instruction=special_instructions,
                 sheet_name=sheet_name,
                 previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
-                rules=sheet_rules  # Pass verified rules
+                rules=sheet_rules,  # Pass verified rules
+                samples=sheet_info.get("samples", {})  # Pass original samples for pattern matching
             )
 
             generated_data_by_sheet[sheet_name] = {
