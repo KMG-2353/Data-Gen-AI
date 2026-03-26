@@ -474,7 +474,7 @@ CROSS-SHEET CONSISTENCY - Reuse matching field values from:
             if prev_data:
                 previous_context += f"\n{prev_name}: {json.dumps(prev_data[:2], indent=2, default=str)}\n"
 
-    prompt = f"""Generate values for these columns following the EXACT SAME PATTERN as the original samples.
+    prompt = f"""Generate NEW, UNIQUE values for these columns following the same PATTERN and FORMAT as the original samples.
 
 Sheet: "{sheet_name}"
 Number of rows needed: {row_count}
@@ -483,13 +483,13 @@ COLUMNS TO GENERATE WITH THEIR ORIGINAL SAMPLE VALUES:
 {json.dumps(columns_with_samples, indent=2)}
 
 CRITICAL INSTRUCTIONS:
-1. COPY THE EXACT PATTERN from the original_samples - same format, same style, same length
-2. DO NOT be creative - generate data that looks IDENTICAL in format to the samples
-3. If samples show "Apex Logistics Ltd", generate similar company names like "Summit Industries Corp"
-4. If samples show addresses like "8337 HWY 431 N", generate addresses in the SAME format
-5. Match the EXACT character patterns, spacing, capitalization from samples
-6. For numeric values, stay within the same range as samples
-7. DO NOT add extra formatting or change the style
+1. FOLLOW the same FORMAT/STYLE as the samples (e.g., "First Last" name format, address structure)
+2. Generate DIFFERENT values - DO NOT copy the exact sample values
+3. If samples show names like "John Doe, Mark Doe", generate NEW names like "Sarah Smith, Michael Chen"
+4. If samples show addresses like "123 Ny Street, 11115", generate NEW addresses in the SAME format
+5. Match character patterns, capitalization, spacing from samples
+6. For numeric values, stay within a similar range but use different numbers
+7. Ensure variety - each row should have unique values
 
 {existing_context}
 {previous_context}
@@ -499,7 +499,7 @@ Additional instructions: {special_instruction}
 Return a JSON object with key "data" containing an array of {row_count} objects.
 Each object should ONLY have keys for: {json.dumps(columns)}
 
-Example: {{"data": [{{"{columns[0]}": "value matching sample pattern"}}, ...]}}"""
+Example: {{"data": [{{"{columns[0]}": "new value matching sample format"}}, ...]}}"""
 
     max_retries = 2
     for attempt in range(max_retries):
@@ -508,7 +508,7 @@ Example: {{"data": [{{"{columns[0]}": "value matching sample pattern"}}, ...]}}"
                 model=model_name,
                 max_tokens=8192,
                 messages=[{"role": "user", "content": prompt}],
-                system="You are a precise data replicator. Generate data that EXACTLY matches the format and style of the provided samples. Do NOT be creative - copy the pattern precisely. Return valid JSON only.",
+                system="You are a realistic test data generator. Generate NEW, UNIQUE values that match the FORMAT and STYLE of samples but with DIFFERENT content. Never copy exact sample values. Return valid JSON only.",
             )
 
             text = "".join(block.text for block in response.content if block.type == "text")
@@ -558,10 +558,10 @@ def _generate_full_llm(
 
         if sample_data:
             sample_context = f"""
-ORIGINAL SAMPLE DATA - YOU MUST FOLLOW THESE EXACT PATTERNS:
+ORIGINAL SAMPLE DATA - FOLLOW THE FORMAT/STYLE BUT GENERATE NEW VALUES:
 {json.dumps(sample_data, indent=2)}
 
-CRITICAL: Generate data that looks EXACTLY like these samples - same format, style, and patterns.
+CRITICAL: Generate NEW data that follows the same FORMAT and STYLE as these samples, but with DIFFERENT values. Do NOT copy the exact sample values.
 """
 
     previous_context = ""
@@ -572,7 +572,7 @@ CROSS-SHEET CONSISTENCY - Reuse matching field values from:
         for prev_name, prev_data in previous_sheets_data.items():
             previous_context += f"\n--- {prev_name} ---\n{json.dumps(prev_data[:2], indent=2, default=str)}\n"
 
-    prompt = f"""Generate {row_count} rows of data following the EXACT patterns from the samples.
+    prompt = f"""Generate {row_count} rows of NEW, UNIQUE test data following the same FORMAT and STYLE as the samples.
 
 Sheet: "{sheet_name}"
 Columns: {json.dumps(headers)}
@@ -583,11 +583,12 @@ Columns: {json.dumps(headers)}
 Instructions: {special_instruction}
 
 RULES:
-1. COPY the exact format and style from the sample data
-2. DO NOT be creative - replicate the patterns precisely
-3. Match character patterns, spacing, capitalization exactly
-4. Data Set: DS_01, DS_02, etc.
-5. Expiration = Effective + 1 year
+1. Follow the same FORMAT and STYLE as samples (naming conventions, address formats, etc.)
+2. Generate NEW, DIFFERENT values - DO NOT copy exact sample values
+3. Ensure variety across rows - each row should have unique values
+4. Match character patterns, spacing, capitalization from samples
+5. Data Set: DS_01, DS_02, etc.
+6. Expiration = Effective + 1 year
 
 Return: {{"data": [{{...}}, ...]}}"""
 
@@ -598,7 +599,7 @@ Return: {{"data": [{{...}}, ...]}}"""
                 model=model_name,
                 max_tokens=8192,
                 messages=[{"role": "user", "content": prompt}],
-                system="You are a precise data replicator. Copy the EXACT format and style from samples. Do NOT add creativity. Return valid JSON only.",
+                system="You are a realistic test data generator. Generate NEW, UNIQUE values that match the FORMAT and STYLE of samples but with DIFFERENT content. Never copy exact sample values. Return valid JSON only.",
             )
 
             text = "".join(block.text for block in response.content if block.type == "text")
