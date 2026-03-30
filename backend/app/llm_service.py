@@ -2,6 +2,9 @@ from openai import OpenAI
 import json
 import os
 import time
+import random
+import re
+from datetime import date
 from typing import Any
 
 
@@ -35,6 +38,174 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
         return [parsed]
 
     raise ValueError(f"Model output is not a JSON array or wrapped array. Got: {type(parsed)}")
+
+
+def _extract_effective_expiration_year_range(special_instruction: str) -> tuple[int, int] | None:
+    """Extract year range like 2020-2026 when instructions mention effective/expiration dates."""
+    if not special_instruction:
+        return None
+
+    text = special_instruction.lower()
+    has_date_intent = any(
+        phrase in text
+        for phrase in [
+            "effective",
+            "expiration",
+            "expiry",
+            "effective date",
+            "expiration date",
+        ]
+    )
+    if not has_date_intent:
+        return None
+
+    match = re.search(r"(20\d{2})\s*(?:-|to|–|—)\s*(20\d{2})", text)
+    if not match:
+        return None
+
+    start_year = int(match.group(1))
+    end_year = int(match.group(2))
+    if start_year > end_year:
+        start_year, end_year = end_year, start_year
+    return start_year, end_year
+
+
+def _has_date_intent(special_instruction: str) -> bool:
+    text = (special_instruction or "").lower()
+    return any(
+        phrase in text
+        for phrase in [
+            "effective",
+            "expiration",
+            "expiry",
+            "date range",
+            "from 20",
+            "current date",
+            "current year",
+        ]
+    )
+
+
+def _include_every_year_requested(special_instruction: str) -> bool:
+    text = (special_instruction or "").lower()
+    return any(
+        phrase in text
+        for phrase in [
+            "every year",
+            "each year",
+            "all years",
+            "year from",
+            "years from",
+            "to be included",
+            "include all years",
+        ]
+    )
+
+
+def _find_header_key(row: dict[str, Any], candidates: list[str]) -> str | None:
+    """Find a header key by case-insensitive substring match."""
+    for key in row.keys():
+        key_lower = key.lower()
+        if any(candidate in key_lower for candidate in candidates):
+            return key
+    return None
+
+
+def _format_mmddyyyy(value: date) -> str:
+    return value.strftime("%m/%d/%Y")
+
+
+def _add_one_year(value: date) -> date:
+    try:
+        return value.replace(year=value.year + 1)
+    except ValueError:
+        # Handle Feb 29 -> Feb 28 on non-leap years.
+        return value.replace(month=2, day=28, year=value.year + 1)
+
+
+def _build_date_policy_summary(special_instruction: str) -> str:
+    """Return compact guidance injected into the prompt."""
+    year_range = _extract_effective_expiration_year_range(special_instruction)
+    include_every_year = _include_every_year_requested(special_instruction)
+
+    if year_range:
+        start_year, end_year = year_range
+        if include_every_year:
+            return (
+                "Apply date range policy from user instruction: include all years in "
+                f"{start_year}-{end_year} across generated rows, and keep expiration one year after effective when possible."
+            )
+        return (
+            "Apply date range policy from user instruction: effective/expiration dates must follow "
+            f"the range {start_year}-{end_year}."
+        )
+
+    return "No explicit date range instruction. Use current year for effective date; expiration is one year later."
+
+
+def _enforce_effective_expiration_date_range(
+    rows: list[dict[str, Any]],
+    special_instruction: str,
+) -> list[dict[str, Any]]:
+    """Apply instruction-driven policy for effective/expiration dates."""
+    year_range = _extract_effective_expiration_year_range(special_instruction)
+    effective_candidates = ["effective date", "effective"]
+    expiration_candidates = ["expiration date", "expiry date", "expiry", "expiration", "exp date"]
+
+    include_every_year = _include_every_year_requested(special_instruction)
+    today = date.today()
+
+    effective_cycle: list[int] = []
+    if year_range:
+        start_year, end_year = year_range
+        if end_year - start_year >= 1:
+            # Inclusive so a request like 2020-2026 contains 2026 in effective years.
+            effective_cycle = list(range(start_year, end_year + 1))
+        else:
+            effective_cycle = [start_year]
+
+        if include_every_year and not effective_cycle:
+            effective_cycle = [start_year]
+
+    for idx, row in enumerate(rows):
+        effective_key = _find_header_key(row, effective_candidates)
+        expiration_key = _find_header_key(row, expiration_candidates)
+        if not effective_key and not expiration_key:
+            continue
+
+        # Default behavior when user did not provide explicit date intent: current year.
+        if not year_range and not _has_date_intent(special_instruction):
+            effective_dt = today
+            expiration_dt = _add_one_year(effective_dt)
+        elif year_range:
+            start_year, end_year = year_range
+            if include_every_year and effective_cycle:
+                effective_year = effective_cycle[idx % len(effective_cycle)]
+            else:
+                if end_year - start_year >= 1:
+                    effective_year = random.randint(start_year, end_year)
+                else:
+                    effective_year = start_year
+
+            effective_month = random.randint(1, 12)
+            effective_day = random.randint(1, 28)
+            effective_dt = date(effective_year, effective_month, effective_day)
+            expiration_dt = _add_one_year(effective_dt)
+
+            # Keep expiration year inside range whenever possible.
+            if expiration_dt.year > end_year:
+                expiration_dt = date(end_year, effective_month, effective_day)
+        else:
+            # User provided date intent but no parseable range. Respect current-date baseline.
+            effective_dt = today
+            expiration_dt = _add_one_year(effective_dt)
+
+        if effective_key:
+            row[effective_key] = _format_mmddyyyy(effective_dt)
+        if expiration_key:
+            row[expiration_key] = _format_mmddyyyy(expiration_dt)
+
+    return rows
 
 def configure_openai() -> OpenAI:
     """Configure OpenAI client with API key from environment."""
@@ -81,6 +252,11 @@ x generated data:
             previous_context += json.dumps(prev_data, indent=2)
             previous_context += "\n"
 
+    user_instruction_block = (special_instruction or "").strip()
+    if not user_instruction_block:
+        user_instruction_block = "No additional instructions provided."
+    date_policy_summary = _build_date_policy_summary(special_instruction)
+
     prompt = f"""You are a test data generator for US insurance applications.
 
 You are generating data for sheet: "{sheet_name}"
@@ -95,8 +271,14 @@ Use ALL column names exactly as provided (including suffixes) as JSON keys.
 
 {previous_context}
 
-Make sure you follow the below important rules and {special_instruction} given by users for particular sheet and column name.
-The Special Instruction should be prioritized before the important rules.  
+INSTRUCTION PRIORITY (highest to lowest):
+1. USER SPECIAL INSTRUCTIONS (MUST be followed exactly when relevant):
+    {user_instruction_block}
+2. Cross-sheet consistency constraints from previously generated sheets.
+3. Default important rules below (apply ONLY when they do not conflict with user special instructions).
+
+DATE POLICY FOR EFFECTIVE/EXPIRATION:
+{date_policy_summary}
 
 IMPORTANT RULES:
 1. Generate realistic US insurance test data
@@ -111,8 +293,8 @@ IMPORTANT RULES:
 5. Names should be diverse and realistic
 6. Addresses should be realistic US addresses
 7. For vehicles no and other vehicle detail make sure you follow the United States formats.
-8. The effective date column is of today's date (2026 year) or one day after today. 
-9. The expiration date column is complete one year gap from the effective date.
+8. If no date-specific user instruction is provided, set Effective Date to today's date or one day after today.
+9. If no date-specific user instruction is provided, set Expiration Date to one year after Effective Date.
 10. All the Dollar values should be numbers and not in string. But should have a dollar sign before them.
 11. The Data Set column will always start with DS_1, DS_2. The number will increase for each test case.
 12. The effective date, expiration date should match across all sheets. There should not be mismatch for each test case row.
@@ -137,7 +319,7 @@ Example format:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a precise JSON-only data generator for US insurance test datasets. Always return a JSON object with a single key \"data\" containing an array of row objects."
+                        "content": "You are a precise JSON-only data generator for US insurance test datasets. Always return a JSON object with a single key \"data\" containing an array of row objects. If user special instructions conflict with defaults, follow user special instructions."
                     },
                     {
                         "role": "user",
@@ -161,6 +343,11 @@ Example format:
             if not normalized:
                 raise ValueError("Model output did not contain valid row objects")
 
+            normalized = _enforce_effective_expiration_date_range(
+                normalized,
+                special_instruction,
+            )
+
             return normalized
         except Exception as e:
             error_msg = str(e)
@@ -174,4 +361,3 @@ Example format:
                 raise
 
     raise RuntimeError("OpenAI response was not received after retries")
-
