@@ -1,16 +1,15 @@
-import anthropic
 import json
-import os
 import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable
+import google.generativeai as genai
 
 from .pattern_detector import analyze_sheet_patterns_deterministic
 
 
-# Default model - Claude Sonnet 4 is excellent for pattern recognition
-DEFAULT_MODEL = "claude-sonnet-4-6"
+# Default Gemini model
+DEFAULT_MODEL = "gemini-2.5-pro"
 
 
 def _clean_response_text(text: str) -> str:
@@ -45,12 +44,47 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     raise ValueError(f"Model output is not a JSON array or wrapped array. Got: {type(parsed)}")
 
 
-def configure_anthropic() -> anthropic.Anthropic:
-    """Configure Anthropic client with API key from environment."""
-    key = os.getenv("CLAUDE_API_KEY")
-    if not key:
-        raise ValueError("CLAUDE_API_KEY not found in environment")
-    return anthropic.Anthropic(api_key=key)
+def configure_google(api_key: str) -> Any:
+    """Configure Gemini SDK with explicit API key (no environment reads)."""
+    if not api_key or not api_key.strip():
+        raise ValueError("Google API key is required")
+    genai.configure(api_key=api_key)
+    return genai
+
+
+def _google_text_response(
+    client: Any,
+    model_name: str,
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int,
+) -> str:
+    """Get text response from Gemini model generate_content."""
+    model = client.GenerativeModel(model_name=model_name, system_instruction=system_prompt)
+    response = model.generate_content(
+        user_prompt,
+        generation_config=client.GenerationConfig(max_output_tokens=max_tokens),
+    )
+
+    text = getattr(response, "text", None)
+    if text:
+        return str(text)
+
+    candidates = getattr(response, "candidates", None) or []
+    for candidate in candidates:
+        content = getattr(candidate, "content", None)
+        parts = getattr(content, "parts", None) if content else None
+        if not parts:
+            continue
+        collected: list[str] = []
+        for part in parts:
+            part_text = getattr(part, "text", None)
+            if part_text:
+                collected.append(str(part_text))
+        if collected:
+            return "".join(collected)
+
+    return ""
 
 
 def _normalize_header_name(header: str) -> str:
@@ -66,7 +100,10 @@ def _looks_like_test_case_header(header: str) -> bool:
         return False
 
     # Common variants: Test Case #, Test Case No, TestCaseNumber, etc.
-    if "testcase" in normalized:
+    # Avoid broad matching like "test case details".
+    if normalized in {"testcase", "testcaseid", "testcaseno", "testcasenum", "testcasenumber"}:
+        return True
+    if normalized.startswith("testcase") and any(k in normalized for k in ("id", "no", "num", "number")):
         return True
 
     # Support short forms like TS Number / TS No, but avoid generic "type" etc.
@@ -74,6 +111,19 @@ def _looks_like_test_case_header(header: str) -> bool:
         return True
 
     return False
+
+
+def _looks_like_identifier_value(value: str) -> bool:
+    """Heuristic check for identifier-like values to avoid contaminating ID pools."""
+    if not value:
+        return False
+    if len(value) > 64:
+        return False
+    if " " in value:
+        return False
+    if not any(ch.isdigit() for ch in value):
+        return False
+    return bool(re.match(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$", value))
 
 
 def _header_category(header: str) -> str | None:
@@ -116,6 +166,284 @@ def _header_category(header: str) -> str | None:
 def _is_strict_reference_category(category: str) -> bool:
     """Categories that should be reused across sheets as canonical references."""
     return category in {"test_case_id", "policy_id", "driver_id", "vehicle_id"}
+
+
+def _is_insurance_context(headers: list[str], sheet_name: str, special_instruction: str) -> bool:
+    """Detect whether planner/validator should enforce insurance lifecycle semantics."""
+    haystack = " ".join(headers + [sheet_name, special_instruction]).lower()
+    signals = (
+        "policy",
+        "transaction",
+        "coverage",
+        "premium",
+        "driver",
+        "vehicle",
+        "insured",
+        "renewal",
+        "endorsement",
+        "cancellation",
+        "reinstatement",
+    )
+    return sum(1 for s in signals if s in haystack) >= 2
+
+
+def _transaction_cycle_from_instruction(special_instruction: str) -> list[str]:
+    """Build the transaction cycle requested by the instruction text."""
+    text = (special_instruction or "").lower()
+    cycle = ["NB"]
+
+    if any(k in text for k in ("endorsement", "mid-term", "mta")):
+        cycle.append("ENDORSEMENT")
+    if any(k in text for k in ("cancel", "cancellation", "flat cancel")):
+        cycle.append("CANCELLATION")
+    if any(k in text for k in ("reinstate", "reinstatement")):
+        cycle.append("REINSTATEMENT")
+    if "renewal" in text:
+        cycle.append("RENEWAL")
+
+    if len(cycle) == 1:
+        cycle.extend(["ENDORSEMENT", "RENEWAL"])
+
+    return cycle
+
+
+def _build_insurance_scenarios(
+    row_count: int,
+    previous_sheets_data: dict[str, Any] | None,
+    special_instruction: str,
+) -> list[dict[str, Any]]:
+    """Build deterministic lifecycle scenarios keyed by TestCase/Policy IDs."""
+    reference_by_category = _build_reference_values_by_category(previous_sheets_data)
+    case_pool = reference_by_category.get("test_case_id", [])
+    policy_pool = reference_by_category.get("policy_id", [])
+
+    cycle = _transaction_cycle_from_instruction(special_instruction)
+    cycle_len = max(1, len(cycle))
+    case_count = max(1, row_count // cycle_len)
+
+    if case_pool:
+        case_count = min(case_count, len(case_pool))
+
+    base_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    scenarios: list[dict[str, Any]] = []
+
+    for case_idx in range(case_count):
+        test_case_id = case_pool[case_idx] if case_idx < len(case_pool) else f"TS-{case_idx + 1:04d}"
+        policy_id = policy_pool[case_idx] if case_idx < len(policy_pool) else f"POL-{case_idx + 1:06d}"
+
+        inception = base_date + timedelta(days=case_idx)
+        expiration = inception + timedelta(days=365)
+        cancellation_date: datetime | None = None
+
+        for step, txn_type in enumerate(cycle):
+            if len(scenarios) >= row_count:
+                return scenarios
+
+            if txn_type == "NB":
+                txn_date = inception
+                effective = inception
+                exp = expiration
+            elif txn_type == "ENDORSEMENT":
+                txn_date = inception + timedelta(days=30)
+                effective = inception
+                exp = expiration
+            elif txn_type == "CANCELLATION":
+                txn_date = inception + timedelta(days=120)
+                cancellation_date = txn_date
+                effective = inception
+                exp = expiration
+            elif txn_type == "REINSTATEMENT":
+                txn_date = (cancellation_date or inception + timedelta(days=120)) + timedelta(days=5)
+                effective = inception
+                exp = expiration
+            elif txn_type == "RENEWAL":
+                txn_date = expiration
+                effective = expiration
+                exp = expiration + timedelta(days=365)
+            else:
+                txn_date = inception + timedelta(days=step * 15)
+                effective = inception
+                exp = expiration
+
+            scenarios.append(
+                {
+                    "test_case_id": test_case_id,
+                    "policy_id": policy_id,
+                    "transaction_type": txn_type,
+                    "transaction_date": txn_date,
+                    "effective_date": effective,
+                    "expiration_date": exp,
+                    "cancellation_date": cancellation_date,
+                    "reinstatement_date": txn_date if txn_type == "REINSTATEMENT" else None,
+                    "driver_changed": txn_type == "ENDORSEMENT",
+                    "vehicle_changed": txn_type == "ENDORSEMENT",
+                }
+            )
+
+    while len(scenarios) < row_count:
+        scenarios.append(scenarios[len(scenarios) % max(1, len(scenarios))])
+
+    return scenarios[:row_count]
+
+
+def _header_role(header: str) -> str | None:
+    """Classify a header into deterministic insurance roles."""
+    normalized = _normalize_header_name(header)
+    category = _header_category(header)
+    if category == "test_case_id":
+        return "test_case_id"
+    if category == "policy_id":
+        return "policy_id"
+
+    if "transactiontype" in normalized or normalized in {"trantype", "trxtype"}:
+        return "transaction_type"
+    if "transactiondate" in normalized or normalized in {"trandate", "trxdate"}:
+        return "transaction_date"
+    if "effectivedate" in normalized or normalized in {"effdate", "inceptiondate"}:
+        return "effective_date"
+    if "expirationdate" in normalized or "expirydate" in normalized or normalized == "expdate":
+        return "expiration_date"
+    if "cancellationdate" in normalized or "canceldate" in normalized:
+        return "cancellation_date"
+    if "reinstatementdate" in normalized or "reinstate" in normalized:
+        return "reinstatement_date"
+    if "status" in normalized:
+        return "policy_status"
+    if "driverchange" in normalized:
+        return "driver_changed"
+    if "vehiclechange" in normalized:
+        return "vehicle_changed"
+    if "drivercount" in normalized:
+        return "driver_count"
+    if "vehiclecount" in normalized:
+        return "vehicle_count"
+
+    return None
+
+
+def _to_date(value: Any) -> datetime | None:
+    """Parse incoming value to datetime when possible."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_date(value: datetime | None) -> str:
+    return value.strftime("%Y-%m-%d") if value else ""
+
+
+def _apply_insurance_scenario_projection(
+    rows: list[dict[str, Any]],
+    headers: list[str],
+    sheet_name: str,
+    special_instruction: str,
+    previous_sheets_data: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Project deterministic scenario values into known insurance lifecycle columns."""
+    if not rows or not _is_insurance_context(headers, sheet_name, special_instruction):
+        return rows
+
+    scenarios = _build_insurance_scenarios(len(rows), previous_sheets_data, special_instruction)
+    for idx, row in enumerate(rows):
+        scenario = scenarios[idx]
+        for header in headers:
+            role = _header_role(header)
+            if role is None:
+                continue
+
+            if role in {"test_case_id", "policy_id", "transaction_type"}:
+                row[header] = scenario[role]
+            elif role in {
+                "transaction_date",
+                "effective_date",
+                "expiration_date",
+                "cancellation_date",
+                "reinstatement_date",
+            }:
+                row[header] = _fmt_date(scenario.get(role))
+            elif role in {"driver_changed", "vehicle_changed"}:
+                row[header] = "Y" if scenario[role] else "N"
+            elif role == "policy_status":
+                row[header] = "Cancelled" if scenario["transaction_type"] == "CANCELLATION" else "Active"
+            elif role == "driver_count":
+                row[header] = 2 if scenario["driver_changed"] else 1
+            elif role == "vehicle_count":
+                row[header] = 2 if scenario["vehicle_changed"] else 1
+
+    return rows
+
+
+def _validate_and_repair_insurance_rows(rows: list[dict[str, Any]], headers: list[str]) -> list[dict[str, Any]]:
+    """Enforce deterministic temporal and status consistency for insurance rows."""
+    if not rows:
+        return rows
+
+    for row in rows:
+        role_to_header: dict[str, str] = {}
+        for header in headers:
+            role = _header_role(header)
+            if role:
+                role_to_header[role] = header
+
+        txn_type = str(row.get(role_to_header.get("transaction_type", ""), "")).strip().upper()
+
+        eff = _to_date(row.get(role_to_header.get("effective_date", "")))
+        exp = _to_date(row.get(role_to_header.get("expiration_date", "")))
+        txn = _to_date(row.get(role_to_header.get("transaction_date", "")))
+        cancel = _to_date(row.get(role_to_header.get("cancellation_date", "")))
+        rein = _to_date(row.get(role_to_header.get("reinstatement_date", "")))
+
+        if eff and not exp:
+            exp = eff + timedelta(days=365)
+
+        if eff and exp and (exp - eff).days < 300:
+            exp = eff + timedelta(days=365)
+
+        if txn_type == "CANCELLATION":
+            if not cancel:
+                cancel = txn or (eff + timedelta(days=120) if eff else None)
+            if txn and cancel and cancel < txn:
+                cancel = txn
+
+        if txn_type == "REINSTATEMENT":
+            if not cancel and eff:
+                cancel = eff + timedelta(days=120)
+            if not rein and cancel:
+                rein = cancel + timedelta(days=5)
+            if rein and cancel and rein <= cancel:
+                rein = cancel + timedelta(days=1)
+
+        if role_to_header.get("effective_date"):
+            row[role_to_header["effective_date"]] = _fmt_date(eff)
+        if role_to_header.get("expiration_date"):
+            row[role_to_header["expiration_date"]] = _fmt_date(exp)
+        if role_to_header.get("transaction_date") and txn:
+            row[role_to_header["transaction_date"]] = _fmt_date(txn)
+        if role_to_header.get("cancellation_date"):
+            row[role_to_header["cancellation_date"]] = _fmt_date(cancel)
+        if role_to_header.get("reinstatement_date"):
+            row[role_to_header["reinstatement_date"]] = _fmt_date(rein)
+
+        if role_to_header.get("driver_changed"):
+            row[role_to_header["driver_changed"]] = "Y" if txn_type == "ENDORSEMENT" else "N"
+        if role_to_header.get("vehicle_changed"):
+            row[role_to_header["vehicle_changed"]] = "Y" if txn_type == "ENDORSEMENT" else "N"
+        if role_to_header.get("policy_status"):
+            row[role_to_header["policy_status"]] = "Cancelled" if txn_type == "CANCELLATION" else "Active"
+
+    return rows
 
 
 def _extract_reference_values_from_rows(
@@ -168,6 +496,9 @@ def _build_reference_values_by_category(previous_sheets_data: dict[str, Any] | N
 
                 value_str = str(value).strip()
                 if not value_str:
+                    continue
+
+                if _is_strict_reference_category(category) and not _looks_like_identifier_value(value_str):
                     continue
 
                 if category not in by_category:
@@ -335,7 +666,10 @@ def _enforce_cross_sheet_consistency(
 def analyze_sheet_patterns(
     sheet_name: str,
     headers: list[str],
-    samples: dict[str, list[Any]]
+    samples: dict[str, list[Any]],
+    special_instruction: str = "",
+    api_key: str | None = None,
+    model_name: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
     """
     Analyze sample data to extract patterns and rules for each column.
@@ -357,10 +691,12 @@ def analyze_sheet_patterns(
     if not low_confidence_rules:
         return deterministic_result
 
-    # Step 3: Use LLM only for low-confidence columns
+    # Step 3: Use LLM only for low-confidence columns when API key is available
+    if not api_key or not api_key.strip():
+        return deterministic_result
+
     try:
-        client = configure_anthropic()
-        model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+        client = configure_google(api_key)
 
         # Only send low-confidence columns to LLM
         columns_for_llm = []
@@ -374,9 +710,17 @@ def analyze_sheet_patterns(
                 "current_detection": rule.get("description", "Unknown")
             })
 
+        instruction_context = ""
+        if special_instruction and special_instruction.strip():
+            instruction_context = f"""
+    SPECIAL INSTRUCTION CONTEXT (use this to infer domain meaning for ambiguous text fields):
+    {special_instruction}
+    """
+
         prompt = f"""Analyze ONLY these columns that need pattern clarification:
 
 {json.dumps(columns_for_llm, indent=2)}
+    {instruction_context}
 
 For each column, determine:
 1. rule_type: One of "format", "range", "enum", "pattern", "text"
@@ -386,14 +730,13 @@ For each column, determine:
 Return JSON:
 {{"rules": [{{"column_name": "...", "rule_type": "...", "description": "...", "constraints": {{}}}}]}}"""
 
-        response = client.messages.create(
-            model=model_name,
+        text = _google_text_response(
+            client=client,
+            model_name=model_name,
+            system_prompt="You are a data analyst. Analyze only ambiguous columns. Return valid JSON only.",
+            user_prompt=prompt,
             max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-            system="You are a data analyst. Analyze only ambiguous columns. Return valid JSON only.",
         )
-
-        text = "".join(block.text for block in response.content if block.type == "text")
 
         if text.strip():
             llm_result = json.loads(_clean_response_text(text))
@@ -420,11 +763,12 @@ Return JSON:
 def refine_rule(
     current_rule: dict[str, Any],
     user_feedback: str,
-    sample_values: list[Any]
+    sample_values: list[Any],
+    api_key: str,
+    model_name: str = DEFAULT_MODEL,
 ) -> dict[str, Any]:
     """Refine a rule based on user feedback using LLM."""
-    client = configure_anthropic()
-    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+    client = configure_google(api_key)
 
     sample_strs = [str(v) for v in sample_values[:10]]
 
@@ -457,26 +801,16 @@ Return a JSON object with the SAME structure as the input rule:
   "llm_reasoning": "Explanation of what changed based on feedback"
 }}"""
 
-    response = client.messages.create(
-        model=model_name,
+    text = _google_text_response(
+        client=client,
+        model_name=model_name,
+        system_prompt="You are a data rule refinement assistant. Update rules based on user feedback. Return valid JSON only.",
+        user_prompt=prompt,
         max_tokens=2048,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            },
-        ],
-        system="You are a data rule refinement assistant. Update rules based on user feedback. Return valid JSON only.",
     )
 
-    # Extract text from response
-    text = ""
-    for block in response.content:
-        if block.type == "text":
-            text += block.text
-
     if not text.strip():
-        raise ValueError("Claude returned an empty response")
+        raise ValueError("Model returned an empty response")
 
     return json.loads(_clean_response_text(text))
 
@@ -588,6 +922,8 @@ def generate_test_data(
     headers: list[str],
     row_count: int,
     special_instruction: str,
+    api_key: str,
+    model_name: str = DEFAULT_MODEL,
     sheet_name: str = "",
     previous_sheets_data: dict[str, Any] | None = None,
     rules: dict[str, Any] | None = None,
@@ -599,25 +935,15 @@ def generate_test_data(
     2. Use LLM only for text/complex fields that can't be generated deterministically
     """
 
-    # If we have rules, choose strategy based on special instruction priority.
-    # When a special instruction is provided, treat it as the primary directive
-    # and use detected rules as secondary guidance.
+    # If we have rules, always use hybrid generation so deterministic pattern
+    # constraints remain grounded while LLM fills only complex text fields.
     if rules and "rules" in rules:
-        if special_instruction and special_instruction.strip():
-            return _generate_instruction_first_with_rules(
-                headers=headers,
-                row_count=row_count,
-                special_instruction=special_instruction,
-                sheet_name=sheet_name,
-                previous_sheets_data=previous_sheets_data,
-                rules=rules,
-                samples=samples,
-            )
-
         return _generate_hybrid(
             headers=headers,
             row_count=row_count,
             special_instruction=special_instruction,
+            api_key=api_key,
+            model_name=model_name,
             sheet_name=sheet_name,
             previous_sheets_data=previous_sheets_data,
             rules=rules,
@@ -629,6 +955,8 @@ def generate_test_data(
         headers=headers,
         row_count=row_count,
         special_instruction=special_instruction,
+        api_key=api_key,
+        model_name=model_name,
         sheet_name=sheet_name,
         previous_sheets_data=previous_sheets_data,
         samples=samples
@@ -639,6 +967,8 @@ def _generate_instruction_first_with_rules(
     headers: list[str],
     row_count: int,
     special_instruction: str,
+    api_key: str,
+    model_name: str,
     sheet_name: str,
     previous_sheets_data: dict[str, Any] | None,
     rules: dict[str, Any],
@@ -646,8 +976,7 @@ def _generate_instruction_first_with_rules(
 ) -> list[dict[str, Any]]:
     """Generate rows with explicit priority: special instruction first, rules second."""
 
-    client = configure_anthropic()
-    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+    client = configure_google(api_key)
 
     rules_list = rules.get("rules", [])
     cross_rules = rules.get("cross_column_rules_detailed", [])
@@ -747,17 +1076,16 @@ OUTPUT REQUIREMENTS:
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=model_name,
+            text = _google_text_response(
+                client=client,
+                model_name=model_name,
+                system_prompt="You are a synthetic data generator. Respect instruction priority strictly: special instruction first, detected rules second. Return valid JSON only.",
+                user_prompt=prompt,
                 max_tokens=8192,
-                messages=[{"role": "user", "content": prompt}],
-                system="You are a synthetic data generator. Respect instruction priority strictly: special instruction first, detected rules second. Return valid JSON only.",
             )
 
-            text = "".join(block.text for block in response.content if block.type == "text")
-
             if not text.strip():
-                raise ValueError("Claude returned an empty response")
+                raise ValueError("Model returned an empty response")
 
             data = _parse_json_array(text)
 
@@ -776,6 +1104,16 @@ OUTPUT REQUIREMENTS:
                 headers=headers,
                 previous_sheets_data=previous_sheets_data,
             )
+
+            normalized = _apply_insurance_scenario_projection(
+                rows=normalized,
+                headers=headers,
+                sheet_name=sheet_name,
+                special_instruction=special_instruction,
+                previous_sheets_data=previous_sheets_data,
+            )
+
+            normalized = _validate_and_repair_insurance_rows(normalized, headers)
 
             return normalized
 
@@ -797,6 +1135,8 @@ def _generate_hybrid(
     headers: list[str],
     row_count: int,
     special_instruction: str,
+    api_key: str,
+    model_name: str,
     sheet_name: str,
     previous_sheets_data: dict[str, Any] | None,
     rules: dict[str, Any],
@@ -835,7 +1175,10 @@ def _generate_hybrid(
             columns=llm_columns,
             row_count=row_count,
             rules_list=rules_list,
+            cross_rules=cross_rules,
             special_instruction=special_instruction,
+            api_key=api_key,
+            model_name=model_name,
             sheet_name=sheet_name,
             previous_sheets_data=previous_sheets_data,
             existing_rows=all_rows,
@@ -869,18 +1212,31 @@ def _generate_hybrid(
                 formatted_row[header] = value
         normalized.append(formatted_row)
 
-    return _enforce_cross_sheet_consistency(
+    normalized = _enforce_cross_sheet_consistency(
         rows=normalized,
         headers=headers,
         previous_sheets_data=previous_sheets_data,
     )
+
+    normalized = _apply_insurance_scenario_projection(
+        rows=normalized,
+        headers=headers,
+        sheet_name=sheet_name,
+        special_instruction=special_instruction,
+        previous_sheets_data=previous_sheets_data,
+    )
+
+    return _validate_and_repair_insurance_rows(normalized, headers)
 
 
 def _generate_llm_columns(
     columns: list[str],
     row_count: int,
     rules_list: list[dict[str, Any]],
+    cross_rules: list[dict[str, Any]] | None,
     special_instruction: str,
+    api_key: str,
+    model_name: str,
     sheet_name: str,
     previous_sheets_data: dict[str, Any] | None,
     existing_rows: list[dict[str, Any]],
@@ -888,12 +1244,12 @@ def _generate_llm_columns(
 ) -> list[dict[str, Any]]:
     """Use LLM to generate only specific columns following EXACT patterns from samples."""
 
-    client = configure_anthropic()
-    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+    client = configure_google(api_key)
 
-    # Build rules context with SAMPLE VALUES for each column
+    # Build rules context with constraints and examples for each LLM column
     rules_map = {r["column_name"]: r for r in rules_list}
-    columns_with_samples = []
+    columns_with_samples: list[dict[str, Any]] = []
+    llm_column_rules: list[dict[str, Any]] = []
 
     for col in columns:
         col_info: dict[str, Any] = {"column": col}
@@ -902,6 +1258,15 @@ def _generate_llm_columns(
         if col in rules_map:
             rule = rules_map[col]
             col_info["rule"] = rule.get('description', 'Generate similar values')
+            llm_column_rules.append(
+                {
+                    "column_name": col,
+                    "rule_type": rule.get("rule_type", "text"),
+                    "description": rule.get("description", ""),
+                    "constraints": rule.get("constraints", {}),
+                    "examples": rule.get("examples", [])[:3],
+                }
+            )
 
         # Get ORIGINAL sample values - this is critical for pattern matching
         if samples and col in samples:
@@ -955,30 +1320,35 @@ ANCHORED ENTITY PROFILES (same TestCase/Policy -> same person attributes):
 {json.dumps(sample_profiles, indent=2)}
 """
 
-    prompt = f"""Generate NEW, UNIQUE values for these columns following the same PATTERN and FORMAT as the original samples.
+    prompt = f"""Generate NEW, UNIQUE values for these columns following special instruction and analyzed rules.
 
 Sheet: "{sheet_name}"
 Number of rows needed: {row_count}
 
+SPECIAL INSTRUCTION (HIGHEST PRIORITY):
+{special_instruction}
+
 COLUMNS TO GENERATE WITH THEIR ORIGINAL SAMPLE VALUES:
 {json.dumps(columns_with_samples, indent=2)}
 
+ANALYZED RULES FOR THESE COLUMNS:
+{json.dumps(llm_column_rules, indent=2)}
+
+CROSS-COLUMN RULES:
+{json.dumps(cross_rules or [], indent=2)}
+
 CRITICAL INSTRUCTIONS:
-1. FOLLOW the same FORMAT/STYLE as the samples (e.g., "First Last" name format, address structure)
-2. Generate DIFFERENT values - DO NOT copy the exact sample values
-3. If samples show names like "John Doe, Mark Doe", generate NEW names like "Sarah Smith, Michael Chen"
-4. If samples show addresses like "123 Ny Street, 11115", generate NEW addresses in the SAME format
-5. Match character patterns, capitalization, spacing from samples
-6. For numeric values, stay within a similar range but use different numbers
-7. Ensure variety - each row should have unique values
+1. Follow SPECIAL INSTRUCTION first.
+2. Follow ANALYZED RULES and CROSS-COLUMN RULES for these columns.
+3. Match sample format/style while generating NEW values.
+4. Do not copy exact sample values.
+5. Keep row-to-row data coherent with already generated deterministic fields.
 
 {existing_context}
 {previous_context}
 {reference_context}
 {semantic_reference_context}
 {anchor_profile_context}
-
-Additional instructions: {special_instruction}
 
 Return a JSON object with key "data" containing an array of {row_count} objects.
 Each object should ONLY have keys for: {json.dumps(columns)}
@@ -988,17 +1358,16 @@ Example: {{"data": [{{"{columns[0]}": "new value matching sample format"}}, ...]
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=model_name,
+            text = _google_text_response(
+                client=client,
+                model_name=model_name,
+                system_prompt="You are a strict synthetic data generator. Obey priority order: special instruction first, then analyzed rules/cross-rules, then sample style. Return valid JSON only.",
+                user_prompt=prompt,
                 max_tokens=8192,
-                messages=[{"role": "user", "content": prompt}],
-                system="You are a realistic test data generator. Generate NEW, UNIQUE values that match the FORMAT and STYLE of samples but with DIFFERENT content. Never copy exact sample values. Return valid JSON only.",
             )
 
-            text = "".join(block.text for block in response.content if block.type == "text")
-
             if not text.strip():
-                raise ValueError("Claude returned an empty response")
+                raise ValueError("Model returned an empty response")
 
             data = _parse_json_array(text)
             return data
@@ -1021,14 +1390,15 @@ def _generate_full_llm(
     headers: list[str],
     row_count: int,
     special_instruction: str,
+    api_key: str,
+    model_name: str,
     sheet_name: str,
     previous_sheets_data: dict[str, Any] | None,
     samples: dict[str, list[Any]] | None = None
 ) -> list[dict[str, Any]]:
     """Legacy full LLM generation when no rules are provided."""
 
-    client = configure_anthropic()
-    model_name = os.getenv("CLAUDE_MODEL", DEFAULT_MODEL)
+    client = configure_google(api_key)
 
     # Build sample context
     sample_context = ""
@@ -1108,17 +1478,16 @@ Return: {{"data": [{{...}}, ...]}}"""
     max_retries = 2
     for attempt in range(max_retries):
         try:
-            response = client.messages.create(
-                model=model_name,
+            text = _google_text_response(
+                client=client,
+                model_name=model_name,
+                system_prompt="You are a realistic test data generator. Generate NEW, UNIQUE values that match the FORMAT and STYLE of samples but with DIFFERENT content. Never copy exact sample values. Return valid JSON only.",
+                user_prompt=prompt,
                 max_tokens=8192,
-                messages=[{"role": "user", "content": prompt}],
-                system="You are a realistic test data generator. Generate NEW, UNIQUE values that match the FORMAT and STYLE of samples but with DIFFERENT content. Never copy exact sample values. Return valid JSON only.",
             )
 
-            text = "".join(block.text for block in response.content if block.type == "text")
-
             if not text.strip():
-                raise ValueError("Claude returned an empty response")
+                raise ValueError("Model returned an empty response")
 
             data = _parse_json_array(text)
 
@@ -1129,11 +1498,21 @@ Return: {{"data": [{{...}}, ...]}}"""
             if not normalized:
                 return []
 
-            return _enforce_cross_sheet_consistency(
+            normalized = _enforce_cross_sheet_consistency(
                 rows=normalized,
                 headers=headers,
                 previous_sheets_data=previous_sheets_data,
             )
+
+            normalized = _apply_insurance_scenario_projection(
+                rows=normalized,
+                headers=headers,
+                sheet_name=sheet_name,
+                special_instruction=special_instruction,
+                previous_sheets_data=previous_sheets_data,
+            )
+
+            return _validate_and_repair_insurance_rows(normalized, headers)
 
         except Exception as e:
             error_msg = str(e)
@@ -1146,4 +1525,4 @@ Return: {{"data": [{{...}}, ...]}}"""
             else:
                 raise
 
-    raise RuntimeError("Claude response was not received after retries")
+    raise RuntimeError("Google response was not received after retries")

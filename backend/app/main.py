@@ -10,9 +10,11 @@ import asyncio
 from dotenv import load_dotenv
 from typing import Any
 
-from app.llm_service import generate_test_data, analyze_sheet_patterns, refine_rule
+from app import llm_service as anthropic_service
+from app import gpt_service as openai_service
+from app import google_service
 
-load_dotenv()
+load_dotenv(override=True)
 
 app = FastAPI()
 
@@ -37,6 +39,110 @@ app.add_middleware(
 
 # Store uploaded file data temporarily
 sessions = {}
+
+
+def _get_env_alias(*names: str) -> str | None:
+    """Read environment variable by alias names (case-insensitive fallback)."""
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+
+    lower_aliases = {n.lower() for n in names}
+    for key, value in os.environ.items():
+        if key.lower() in lower_aliases and value:
+            return value
+    return None
+
+
+def _resolve_openai_config(request: dict, session: dict) -> tuple[str | None, str]:
+    """Resolve OpenAI config with backward-compatible fallbacks."""
+    api_key = (
+        request.get("openai_api_key")
+        or request.get("api_key")
+        or session.get("openai_api_key")
+        or _get_env_alias("OPENAI_API_KEY", "OPENAI_KEY", "GPT_API_KEY")
+    )
+    model = (
+        request.get("openai_model")
+        or request.get("model")
+        or session.get("openai_model")
+        or _get_env_alias("OPENAI_MODEL", "MODEL_NAME", "MODEL")
+        or "gpt-5.4-2026-03-05"
+    )
+    return api_key, model
+
+
+def _resolve_google_config(request: dict, session: dict) -> tuple[str | None, str]:
+    """Resolve Google Gemini config with backward-compatible fallbacks."""
+    api_key = (
+        request.get("google_api_key")
+        or request.get("gemini_api_key")
+        or session.get("google_api_key")
+        or _get_env_alias("GEMINI_API_KEY", "GOOGLE_API_KEY")
+    )
+    model = (
+        request.get("google_model")
+        or request.get("gemini_model")
+        or session.get("google_model")
+        or _get_env_alias("GEMINI_MODEL", "GOOGLE_MODEL")
+        or "gemini-2.5-pro"
+    )
+    return api_key, model
+
+
+def _resolve_provider(
+    request: dict,
+    session: dict,
+    openai_api_key: str | None,
+    google_api_key: str | None,
+) -> str:
+    """Resolve active provider: openai, google, or anthropic."""
+    forced_provider = (
+        _get_env_alias("FORCE_PROVIDER", "MODEL_PROVIDER", "MODELPROVIDER", "LLM_PROVIDER", "PROVIDER")
+        or ""
+    ).strip().lower()
+    if forced_provider in ("openai", "gpt"):
+        return "openai"
+    if forced_provider in ("google", "gemini"):
+        return "google"
+    if forced_provider in ("anthropic", "claude"):
+        return "anthropic"
+
+    provider = (request.get("provider") or session.get("provider") or "").strip().lower()
+    if provider in ("openai", "gpt"):
+        return "openai"
+    if provider in ("google", "gemini"):
+        return "google"
+    if provider in ("anthropic", "claude"):
+        return "anthropic"
+
+    # Infer provider from explicit model name hints when provider is omitted.
+    model_hint = (
+        request.get("model")
+        or request.get("openai_model")
+        or request.get("google_model")
+        or request.get("gemini_model")
+        or session.get("openai_model")
+        or session.get("google_model")
+        or ""
+    )
+    model_hint = str(model_hint).strip().lower()
+    if model_hint:
+        if "claude" in model_hint:
+            return "anthropic"
+        if model_hint.startswith("gpt") or model_hint.startswith("o"):
+            return "openai"
+        if "gemini" in model_hint:
+            return "google"
+
+    # Backward-compatible defaulting:
+    # Prefer providers with available API key before falling back to Anthropic.
+    if openai_api_key:
+        return "openai"
+    if google_api_key:
+        return "google"
+    return "anthropic"
 
 # @app.get("/api/hello")
 # def read_hello():
@@ -141,34 +247,58 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
-async def analyze_sheets_stream(session_id: str, sheets_to_analyze: list[str]):
-    """Generator for SSE events during pattern analysis."""
+async def analyze_sheets_stream(
+    session_id: str,
+    sheets_to_analyze: list[str],
+    provider: str,
+    openai_api_key: str | None,
+    openai_model: str,
+    google_api_key: str | None,
+    google_model: str,
+    special_instruction: str,
+):
+    """Generator for SSE events during pattern analysis using selected provider."""
     session = sessions[session_id]
     sheets_data = session["sheets_data"]
     total_sheets = len(sheets_to_analyze)
 
     for idx, sheet_name in enumerate(sheets_to_analyze):
-        # Send sheet_start event
         yield f"data: {json.dumps({'event': 'sheet_start', 'sheet_name': sheet_name, 'progress': idx / total_sheets, 'message': f'Analyzing {sheet_name}...'})}\n\n"
 
         try:
             sheet_info = sheets_data[sheet_name]
 
-            print(f"Analyzing sheet '{sheet_name}' with {len(sheet_info['unique_headers'])} headers")
+            print(f"Analyzing sheet '{sheet_name}' with {len(sheet_info['unique_headers'])} headers using {provider}")
 
-            # Call LLM to analyze patterns
-            rule_set = analyze_sheet_patterns(
-                sheet_name=sheet_name,
-                headers=sheet_info["unique_headers"],
-                samples=sheet_info["samples"]
-            )
+            if provider == "openai":
+                rule_set = openai_service.analyze_sheet_patterns(
+                    sheet_name=sheet_name,
+                    headers=sheet_info["unique_headers"],
+                    samples=sheet_info["samples"],
+                    special_instruction=special_instruction,
+                    api_key=openai_api_key,
+                    model_name=openai_model,
+                )
+            elif provider == "google":
+                rule_set = google_service.analyze_sheet_patterns(
+                    sheet_name=sheet_name,
+                    headers=sheet_info["unique_headers"],
+                    samples=sheet_info["samples"],
+                    special_instruction=special_instruction,
+                    api_key=google_api_key,
+                    model_name=google_model,
+                )
+            else:
+                rule_set = anthropic_service.analyze_sheet_patterns(
+                    sheet_name=sheet_name,
+                    headers=sheet_info["unique_headers"],
+                    samples=sheet_info["samples"],
+                )
 
-            # Store rules in session
             session["rule_sets"][sheet_name] = rule_set
 
             print(f"Successfully analyzed sheet '{sheet_name}' - found {len(rule_set.get('rules', []))} rules")
 
-            # Send sheet_complete event
             yield f"data: {json.dumps({'event': 'sheet_complete', 'sheet_name': sheet_name, 'progress': (idx + 1) / total_sheets, 'rules': rule_set})}\n\n"
 
         except Exception as e:
@@ -178,10 +308,8 @@ async def analyze_sheets_stream(session_id: str, sheets_to_analyze: list[str]):
             print(traceback.format_exc())
             yield f"data: {json.dumps({'event': 'error', 'sheet_name': sheet_name, 'message': error_msg})}\n\n"
 
-        # Small delay to allow frontend to process
         await asyncio.sleep(0.1)
 
-    # Send complete event
     yield f"data: {json.dumps({'event': 'complete', 'progress': 1.0, 'message': 'Analysis complete'})}\n\n"
 
 
@@ -190,15 +318,40 @@ async def analyze_patterns(request: dict):
     """Analyze patterns in uploaded data - returns SSE stream."""
     session_id = request.get("session_id")
     sheets_to_analyze = request.get("sheets_to_analyze")
+    special_instruction = request.get("special_inst", "")
 
     if not session_id or session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
+    openai_api_key, openai_model = _resolve_openai_config(request, session)
+    google_api_key, google_model = _resolve_google_config(request, session)
+    provider = _resolve_provider(request, session, openai_api_key, google_api_key)
+
     sheets = sheets_to_analyze or list(session["sheets_data"].keys())
 
+    # Cache API config for subsequent generate/reprompt calls in same session.
+    if openai_api_key:
+        session["openai_api_key"] = openai_api_key
+        session["openai_model"] = openai_model
+    if google_api_key:
+        session["google_api_key"] = google_api_key
+        session["google_model"] = google_model
+    session["provider"] = provider
+    if special_instruction:
+        session["special_inst"] = special_instruction
+
     return StreamingResponse(
-        analyze_sheets_stream(session_id, sheets),
+        analyze_sheets_stream(
+            session_id,
+            sheets,
+            provider,
+            openai_api_key,
+            openai_model,
+            google_api_key,
+            google_model,
+            special_instruction,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -266,6 +419,12 @@ async def reprompt_rule(request: dict):
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
+    openai_api_key, openai_model = _resolve_openai_config(request, session)
+    google_api_key, google_model = _resolve_google_config(request, session)
+    provider = _resolve_provider(request, session, openai_api_key, google_api_key)
+
+    if not user_feedback:
+        raise HTTPException(status_code=400, detail="user_feedback is required")
 
     if sheet_name not in session.get("rule_sets", {}):
         raise HTTPException(status_code=404, detail="Sheet rules not found")
@@ -289,11 +448,32 @@ async def reprompt_rule(request: dict):
 
     try:
         # Call LLM to refine the rule
-        new_rule = refine_rule(
-            current_rule=current_rule,
-            user_feedback=user_feedback,
-            sample_values=samples
-        )
+        if provider == "openai":
+            if not openai_api_key:
+                raise HTTPException(status_code=400, detail="openai_api_key is required for provider=openai")
+            new_rule = openai_service.refine_rule(
+                current_rule=current_rule,
+                user_feedback=user_feedback,
+                sample_values=samples,
+                api_key=openai_api_key,
+                model_name=openai_model,
+            )
+        elif provider == "google":
+            if not google_api_key:
+                raise HTTPException(status_code=400, detail="gemini_api_key is required for provider=google")
+            new_rule = google_service.refine_rule(
+                current_rule=current_rule,
+                user_feedback=user_feedback,
+                sample_values=samples,
+                api_key=google_api_key,
+                model_name=google_model,
+            )
+        else:
+            new_rule = anthropic_service.refine_rule(
+                current_rule=current_rule,
+                user_feedback=user_feedback,
+                sample_values=samples,
+            )
 
         new_rule["user_modified"] = True
 
@@ -315,13 +495,30 @@ async def generate_data(request: dict):
     """Generate test data using LLM based on verified rules."""
     session_id = request.get("session_id")
     row_count = request.get("row_count", 10)
-    special_instructions = request.get("special_inst", "")
+    special_instructions = request.get("special_inst")
     skip_rules = request.get("skip_rules", False)  # If True, generate without rules (legacy mode)
 
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     session = sessions[session_id]
+    openai_api_key, openai_model = _resolve_openai_config(request, session)
+    google_api_key, google_model = _resolve_google_config(request, session)
+    provider = _resolve_provider(request, session, openai_api_key, google_api_key)
+
+    if not special_instructions:
+        special_instructions = session.get("special_inst", "")
+    else:
+        session["special_inst"] = special_instructions
+
+    if openai_api_key:
+        session["openai_api_key"] = openai_api_key
+        session["openai_model"] = openai_model
+    if google_api_key:
+        session["google_api_key"] = google_api_key
+        session["google_model"] = google_model
+    session["provider"] = provider
+
     sheets_data = session["sheets_data"]
     rule_sets = session.get("rule_sets", {})
 
@@ -338,15 +535,44 @@ async def generate_data(request: dict):
             # Get rules for this sheet if available
             sheet_rules = rule_sets.get(sheet_name) if not skip_rules else None
 
-            data = generate_test_data(
-                headers=unique_headers,
-                row_count=row_count,
-                special_instruction=special_instructions,
-                sheet_name=sheet_name,
-                previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
-                rules=sheet_rules,  # Pass verified rules
-                samples=sheet_info.get("samples", {})  # Pass original samples for pattern matching
-            )
+            if provider == "openai":
+                if not openai_api_key:
+                    raise HTTPException(status_code=400, detail="openai_api_key is required for provider=openai")
+                data = openai_service.generate_test_data(
+                    headers=unique_headers,
+                    row_count=row_count,
+                    special_instruction=special_instructions,
+                    api_key=openai_api_key,
+                    model_name=openai_model,
+                    sheet_name=sheet_name,
+                    previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
+                    rules=sheet_rules,  # Pass verified rules
+                    samples=sheet_info.get("samples", {})  # Pass original samples for pattern matching
+                )
+            elif provider == "google":
+                if not google_api_key:
+                    raise HTTPException(status_code=400, detail="gemini_api_key is required for provider=google")
+                data = google_service.generate_test_data(
+                    headers=unique_headers,
+                    row_count=row_count,
+                    special_instruction=special_instructions,
+                    api_key=google_api_key,
+                    model_name=google_model,
+                    sheet_name=sheet_name,
+                    previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
+                    rules=sheet_rules,
+                    samples=sheet_info.get("samples", {}),
+                )
+            else:
+                data = anthropic_service.generate_test_data(
+                    headers=unique_headers,
+                    row_count=row_count,
+                    special_instruction=special_instructions,
+                    sheet_name=sheet_name,
+                    previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
+                    rules=sheet_rules,
+                    samples=sheet_info.get("samples", {}),
+                )
 
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,
