@@ -7,7 +7,7 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from app.llm_service import generate_test_data
+from app.llm_service import generate_test_data, detect_sheet_type, build_insurance_context
 
 load_dotenv()
 
@@ -119,29 +119,59 @@ async def generate_data(request: dict):
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
         previous_sheets_data = {}
-        
+
+        # Track policy and driver data for cross-sheet row expansion
+        policy_data = None
+        driver_data = None
+
         for sheet_name, unique_headers in unique_headers_by_sheet.items():
             original_headers = original_headers_by_sheet[sheet_name]
-            print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {unique_headers}")
-            
-            # Send unique (deduplicated) headers to LLM
-            data = generate_test_data(
-                headers=unique_headers,
-                row_count=row_count,
-                special_instruction=special_instructions,
-                sheet_name=sheet_name,
-                previous_sheets_data=previous_sheets_data if previous_sheets_data else None
-            )
-            
+
+            # Determine insurance-aware row count and rules
+            sheet_type = detect_sheet_type(sheet_name)
+            effective_row_count = row_count
+            additional_rules = ""
+
+            if policy_data is not None or sheet_type == "policy":
+                effective_row_count, additional_rules = build_insurance_context(
+                    sheet_name=sheet_name,
+                    policy_data=policy_data,
+                    driver_data=driver_data,
+                    original_row_count=row_count,
+                )
+
+            print(f"Generating {effective_row_count} rows for sheet '{sheet_name}' (type={sheet_type}) with headers: {unique_headers}")
+
+            # Handle zero-row sheets (e.g., infraction with no infractions)
+            if effective_row_count == 0:
+                data = []
+            else:
+                # Send unique (deduplicated) headers to LLM
+                data = generate_test_data(
+                    headers=unique_headers,
+                    row_count=row_count,
+                    special_instruction=special_instructions,
+                    sheet_name=sheet_name,
+                    previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
+                    row_count_override=effective_row_count,
+                    additional_rules=additional_rules,
+                )
+
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,
                 "unique_headers": unique_headers,
                 "data": data
             }
-            
+
             # Add this sheet's data to context for subsequent sheets
             previous_sheets_data[sheet_name] = data
-            
+
+            # Track policy and driver data for downstream sheets
+            if sheet_type == "policy":
+                policy_data = data
+            elif sheet_type == "driver":
+                driver_data = data
+
             print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
         
         # Store generated data in session
