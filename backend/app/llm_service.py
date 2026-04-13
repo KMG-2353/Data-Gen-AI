@@ -377,43 +377,43 @@ def build_row_mapping_instructions(
         )
 
     elif sheet_type == "assignment":
+        from app.assignment_logic import to_ordinal as _to_ordinal
+
         row_num = 0
         for ps in policy_structure:
             base_no = ps["test_case_no"]
             txn_type = ps["transaction_type"]
             driver_count = ps["driver_count"]
-            vehicle_count = ps["vehicle_count"]
+            # N = vehicle_count from policy details (eligible count may be less, but
+            # without actual vehicle type data here we use the declared total as a
+            # safe approximation; the deterministic path in main.py uses actual types)
+            N = ps["vehicle_count"]
 
-            for d in range(1, driver_count + 1):
+            for i in range(driver_count):
                 row_num += 1
-                expanded_no = f"{base_no}-{d:02d}"
-
-                # Build vehicle assignment hint
-                veh_hints = []
-                if driver_count == 1 and vehicle_count == 1:
-                    veh_hints.append("Veh #1 = \"1st\"")
+                expanded_no = f"{base_no}-{i + 1:02d}"
+                # Backward rotation: ordinal = (j - i) % N + 1
+                if N == 0:
+                    veh_parts: list[str] = []
                 else:
-                    for v in range(1, vehicle_count + 1):
-                        if d <= vehicle_count and v == d:
-                            veh_hints.append(f"Veh #{v} = \"1st\"")
-                        elif d > vehicle_count and v == 1:
-                            veh_hints.append(f"Veh #{v} = \"1st\"")
-                        else:
-                            veh_hints.append(f"Veh #{v} = \"\" (blank)")
+                    veh_parts = [
+                        f'Veh #{j + 1} = "{_to_ordinal((j - i) % N + 1)}"'
+                        for j in range(N)
+                    ]
 
                 lines.append(
-                    f"  Row {row_num}: Test Case No = \"{expanded_no}\", "
-                    f"Transaction Type = \"{txn_type}\", "
-                    + ", ".join(veh_hints)
+                    f'  Row {row_num}: Test Case No = "{expanded_no}", '
+                    f'Transaction Type = "{txn_type}", '
+                    + (", ".join(veh_parts) if veh_parts else "no vehicle columns")
                 )
 
         return (
-            "EXACT ROW MAPPING FOR ASSIGNMENT SHEET:\n"
-            f"You MUST generate exactly {row_num} rows with these exact Test Case No values:\n"
+            "EXACT ROW MAPPING FOR ASSIGNMENT SHEET (backward rotation formula applied):\n"
+            f"You MUST generate exactly {row_num} rows with these exact values:\n"
             + "\n".join(lines)
             + "\n\nDo NOT deviate from this mapping."
-            + "\nEach driver MUST have at least one vehicle assigned as \"1st\"."
-            + "\nThe Name and Driver Type columns must match the corresponding Driver sheet rows."
+            + "\nThe Name and Driver Type columns MUST match the corresponding Driver sheet rows exactly."
+            + "\nLeave any vehicle columns beyond the ones listed here blank."
         )
 
     elif sheet_type == "summary":
@@ -559,9 +559,20 @@ ASSIGNMENT SHEET RULES:
 - Test Case No format: TS-XX-XX-XX (same suffix as driver number)
 - Name: must match exactly the driver's Name from Driver sheet
 - Driver Type: must match exactly the driver's Driver Type from Driver sheet
-- If 1 Driver & 1 Vehicle: Veh #1 = "1st"
-- Multiple drivers/vehicles: each driver must be assigned to at least one vehicle as "1st"
-- Unassigned vehicle columns should be blank
+- Only vehicles of type "Private Passenger" or "Classic" get assignment columns.
+  All other types (Motorhome, Recreational Trailer, Utility Trailer, Antique, etc.) are skipped.
+- N = count of eligible (Private Passenger or Classic) vehicles in the transaction group
+- Assignment uses a circular rotation formula (backward rotation, default):
+    ordinal for driver i, vehicle j = (j - i) % N + 1  → convert to "1st", "2nd", "3rd", …
+  Example for 4 drivers, 4 vehicles (N=4):
+    Driver 1: 1st  2nd  3rd  4th
+    Driver 2: 4th  1st  2nd  3rd
+    Driver 3: 3rd  4th  1st  2nd
+    Driver 4: 2nd  3rd  4th  1st
+- Every eligible driver (Principal or Occasional) gets a row with ordinals for all N vehicles.
+- Ineligible driver types get a row with blank vehicle columns.
+- Vehicle columns beyond N (if the sheet has more columns than eligible vehicles) must be blank.
+- The EXACT row mapping below pre-computes the correct ordinal for every cell — follow it exactly.
 """
 
 INFRACTION_SHEET_RULES = """

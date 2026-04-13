@@ -8,6 +8,7 @@ import os
 from dotenv import load_dotenv
 
 from app.llm_service import generate_test_data, detect_sheet_type, build_insurance_context
+from app.assignment_logic import build_assignment_rows
 
 load_dotenv()
 
@@ -120,11 +121,25 @@ async def generate_data(request: dict):
         generated_data_by_sheet = {}
         previous_sheets_data = {}
 
-        # Track policy and driver data for cross-sheet row expansion
+        # Track policy, driver, and vehicle data for cross-sheet row expansion
         policy_data = None
         driver_data = None
+        vehicle_data = None
 
-        for sheet_name, unique_headers in unique_headers_by_sheet.items():
+        # Two-pass approach: process non-assignment sheets first so that
+        # policy/driver/vehicle data are always available when the assignment
+        # sheet is processed, regardless of workbook sheet order.
+        sheet_items = list(unique_headers_by_sheet.items())
+        non_assignment_sheets = [
+            (name, hdrs) for name, hdrs in sheet_items
+            if detect_sheet_type(name) != "assignment"
+        ]
+        assignment_sheets = [
+            (name, hdrs) for name, hdrs in sheet_items
+            if detect_sheet_type(name) == "assignment"
+        ]
+
+        for sheet_name, unique_headers in non_assignment_sheets + assignment_sheets:
             original_headers = original_headers_by_sheet[sheet_name]
 
             # Determine insurance-aware row count and rules
@@ -142,8 +157,23 @@ async def generate_data(request: dict):
 
             print(f"Generating {effective_row_count} rows for sheet '{sheet_name}' (type={sheet_type}) with headers: {unique_headers}")
 
+            # --- Deterministic assignment sheet generation ---
+            if (
+                sheet_type == "assignment"
+                and driver_data
+                and vehicle_data
+                and policy_data
+            ):
+                print(f"Using deterministic assignment algorithm for sheet '{sheet_name}'")
+                data = build_assignment_rows(
+                    driver_data=driver_data,
+                    vehicle_data=vehicle_data,
+                    policy_data=policy_data,
+                    assignment_headers=unique_headers,
+                )
+
             # Handle zero-row sheets (e.g., infraction with no infractions)
-            if effective_row_count == 0:
+            elif effective_row_count == 0:
                 data = []
             else:
                 # Send unique (deduplicated) headers to LLM
@@ -166,14 +196,23 @@ async def generate_data(request: dict):
             # Add this sheet's data to context for subsequent sheets
             previous_sheets_data[sheet_name] = data
 
-            # Track policy and driver data for downstream sheets
+            # Track policy, driver, and vehicle data for downstream sheets
             if sheet_type == "policy":
                 policy_data = data
             elif sheet_type == "driver":
                 driver_data = data
+            elif sheet_type == "vehicle":
+                vehicle_data = data
 
             print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
         
+        # Restore original workbook sheet order for the Excel output
+        generated_data_by_sheet = {
+            name: generated_data_by_sheet[name]
+            for name in unique_headers_by_sheet
+            if name in generated_data_by_sheet
+        }
+
         # Store generated data in session
         sessions[session_id]["generated_data_by_sheet"] = generated_data_by_sheet
         
