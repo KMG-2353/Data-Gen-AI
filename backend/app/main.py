@@ -7,7 +7,7 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from app.llm_service import generate_test_data
+from app.llm_service import generate_test_data, extract_lob_flags, filter_rows_by_lob, parse_special_instructions
 
 load_dotenv()
 
@@ -119,11 +119,12 @@ async def generate_data(request: dict):
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
         previous_sheets_data = {}
-        
+        lob_flags = {}  # Will be populated after Policy sheet is generated
+
         for sheet_name, unique_headers in unique_headers_by_sheet.items():
             original_headers = original_headers_by_sheet[sheet_name]
             print(f"Generating {row_count} rows for sheet '{sheet_name}' with headers: {unique_headers}")
-            
+
             # Send unique (deduplicated) headers to LLM
             data = generate_test_data(
                 headers=unique_headers,
@@ -132,16 +133,29 @@ async def generate_data(request: dict):
                 sheet_name=sheet_name,
                 previous_sheets_data=previous_sheets_data if previous_sheets_data else None
             )
-            
+
+            # After Policy sheet is generated, extract LOB flags for conditional filtering
+            if "policy" in sheet_name.lower():
+                lob_flags = extract_lob_flags(data)
+                print(f"Extracted LOB flags from '{sheet_name}': {len(lob_flags)} rows")
+
+            # Filter sub-sheet rows based on LOB flags from Policy
+            # (Defect #216: When LOB=No in Policy, don't include DS in that sheet)
+            if lob_flags:
+                original_count = len(data)
+                data = filter_rows_by_lob(data, sheet_name, lob_flags)
+                if len(data) < original_count:
+                    print(f"LOB filtering: removed {original_count - len(data)} rows from '{sheet_name}' (LOB=No)")
+
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,
                 "unique_headers": unique_headers,
                 "data": data
             }
-            
+
             # Add this sheet's data to context for subsequent sheets
             previous_sheets_data[sheet_name] = data
-            
+
             print(f"Generated {len(data)} rows for sheet '{sheet_name}' successfully")
         
         # Store generated data in session
