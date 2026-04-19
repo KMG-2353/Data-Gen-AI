@@ -2,7 +2,9 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook, Workbook
+from openpyxl.styles import numbers as xl_numbers
 from io import BytesIO
+import re
 import uuid
 import os
 from dotenv import load_dotenv
@@ -10,6 +12,21 @@ from dotenv import load_dotenv
 from app.llm_service import generate_test_data, extract_lob_flags, filter_rows_by_lob, parse_special_instructions
 
 load_dotenv()
+
+# Known misspellings in uploaded templates → canonical sheet name. Applied at
+# upload so the whole pipeline (logging, cross-sheet lookups, output file) uses
+# the corrected spelling.
+SHEET_NAME_FIXES = {
+    "netrate general libiality": "NETRATE GENERAL LIABILITY",
+    "general libiality": "GENERAL LIABILITY",
+    "netrate commericial auto": "NETRATE COMMERCIAL AUTO",
+    "commericial auto": "COMMERCIAL AUTO",
+}
+
+
+def _canonical_sheet_name(name: str) -> str:
+    key = name.lower().strip()
+    return SHEET_NAME_FIXES.get(key, name)
 
 app = FastAPI()
 
@@ -74,8 +91,9 @@ async def upload_file(file: UploadFile = File(...)):
                 else:
                     unique_headers.append(h)
             
-            headers_by_sheet[sheet.title] = original_headers
-            unique_headers_by_sheet[sheet.title] = unique_headers
+            sheet_title = _canonical_sheet_name(sheet.title)
+            headers_by_sheet[sheet_title] = original_headers
+            unique_headers_by_sheet[sheet_title] = unique_headers
         
         workbook.close()
         
@@ -206,7 +224,26 @@ async def download_excel(session_id: str):
         for row_idx, row_data in enumerate(data, 2):
             for col_idx, unique_header in enumerate(unique_headers, 1):
                 value = row_data.get(unique_header, "")
-                sheet.cell(row=row_idx, column=col_idx, value=value)
+                cell = sheet.cell(row=row_idx, column=col_idx)
+                # Force text format for columns that contain codes with
+                # potential leading zeros (ZIP, SIC, NAICS, Data Set IDs).
+                header_lower = unique_header.lower()
+                is_code_col = any(
+                    kw in header_lower
+                    for kw in ("zip", "naics", "sic", "risk class", "data set")
+                )
+                # Also force text for any string value that has a leading zero
+                # followed by more digits (e.g. "02116", "08628").
+                value_str = str(value) if value is not None else ""
+                has_leading_zero = (
+                    isinstance(value, str)
+                    and re.match(r"^0\d+$", value_str)
+                )
+                if is_code_col or has_leading_zero:
+                    cell.value = value_str
+                    cell.number_format = "@"   # Excel text format
+                else:
+                    cell.value = value
         
         # Auto-adjust column widths
         for column in sheet.columns:
