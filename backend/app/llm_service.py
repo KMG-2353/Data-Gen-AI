@@ -25,10 +25,10 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     cleaned = _clean_response_text(text)
 
     parsed = json.loads(cleaned)
-    
+
     if isinstance(parsed, list):
         return parsed
-    
+
     if isinstance(parsed, dict):
         # Look for any value that is a list of dicts (the generated rows)
         for value in parsed.values():
@@ -112,7 +112,7 @@ def _find_header_key(row: dict[str, Any], candidates: list[str]) -> str | None:
 
 
 def _format_mmddyyyy(value: date) -> str:
-    return value.strftime("%m/%d/%Y")
+    return value.strftime("%m%d%Y")
 
 
 def _add_one_year(value: date) -> date:
@@ -148,6 +148,8 @@ def _enforce_effective_expiration_date_range(
     special_instruction: str,
 ) -> list[dict[str, Any]]:
     """Apply instruction-driven policy for effective/expiration dates."""
+    from datetime import timedelta
+
     year_range = _extract_effective_expiration_year_range(special_instruction)
     effective_candidates = ["effective date", "effective"]
     expiration_candidates = ["expiration date", "expiry date", "expiry", "expiration", "exp date"]
@@ -159,7 +161,6 @@ def _enforce_effective_expiration_date_range(
     if year_range:
         start_year, end_year = year_range
         if end_year - start_year >= 1:
-            # Inclusive so a request like 2020-2026 contains 2026 in effective years.
             effective_cycle = list(range(start_year, end_year + 1))
         else:
             effective_cycle = [start_year]
@@ -173,9 +174,23 @@ def _enforce_effective_expiration_date_range(
         if not effective_key and not expiration_key:
             continue
 
-        # Default behavior when user did not provide explicit date intent: current year.
-        if not year_range and not _has_date_intent(special_instruction):
-            effective_dt = today
+        # Check transaction type — Renewal needs effective 300+ days in the past
+        txn_type = ""
+        for key, val in row.items():
+            if "transaction type" in key.lower():
+                txn_type = str(val or "").strip().lower()
+                break
+        is_renewal = "renewal" in txn_type
+
+        if is_renewal:
+            # Renewal: effective date must be >= 300 days in the past
+            days_back = random.randint(300, 400)
+            effective_dt = today - timedelta(days=days_back)
+            expiration_dt = _add_one_year(effective_dt)
+        elif not year_range and not _has_date_intent(special_instruction):
+            # Default: current date ±60 days
+            offset = random.randint(-60, 60)
+            effective_dt = today + timedelta(days=offset)
             expiration_dt = _add_one_year(effective_dt)
         elif year_range:
             start_year, end_year = year_range
@@ -192,12 +207,11 @@ def _enforce_effective_expiration_date_range(
             effective_dt = date(effective_year, effective_month, effective_day)
             expiration_dt = _add_one_year(effective_dt)
 
-            # Keep expiration year inside range whenever possible.
             if expiration_dt.year > end_year:
                 expiration_dt = date(end_year, effective_month, effective_day)
         else:
-            # User provided date intent but no parseable range. Respect current-date baseline.
-            effective_dt = today
+            offset = random.randint(-60, 60)
+            effective_dt = today + timedelta(days=offset)
             expiration_dt = _add_one_year(effective_dt)
 
         if effective_key:
@@ -207,6 +221,7 @@ def _enforce_effective_expiration_date_range(
 
     return rows
 
+
 def configure_openai() -> OpenAI:
     """Configure OpenAI client with API key from environment."""
     key = os.getenv("OPENAI_API_KEY")
@@ -214,38 +229,79 @@ def configure_openai() -> OpenAI:
         raise ValueError("OPENAI_API_KEY not found")
     return OpenAI(api_key=key)
 
+
+# ---------------------------------------------------------------------------
+# Policy type detection (PAP, MCA, etc.)
+# ---------------------------------------------------------------------------
+
+def detect_policy_type(filename: str) -> str:
+    """Detect insurance policy type from the uploaded filename.
+
+    Filename prefixes (case-insensitive) determine the handler:
+      IMS*  → IMS   (commercial insurance, 9-sheet workbook)
+      PAP*  → PAP   (Personal Auto Policy — Quincy)
+      MCA*  → MCA   (future auto policy type)
+      else  → GENERIC (fallback: preserves baseline main behavior)
+
+    The returned string is used as the key in policies.get_handler().
+    """
+    name = (filename or "").strip().upper()
+    # Strip any leading path separators
+    name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if name.startswith("IMS"):
+        return "IMS"
+    if name.startswith("PAP"):
+        return "PAP"
+    if name.startswith("MCA"):
+        return "MCA"
+    return "GENERIC"
+
+
+
+# ---------------------------------------------------------------------------
+# Main generation function
+# ---------------------------------------------------------------------------
+
 def generate_test_data(
     headers: list[str],
     row_count: int,
     special_instruction: str,
     sheet_name: str = "",
     previous_sheets_data: dict[str, Any] | None = None,
+    row_count_override: int | None = None,
+    additional_rules: str = "",
 ) -> list[dict[str, Any]]:
     """Generate test data using OpenAI for US insurance domain."""
 
     client = configure_openai()
     model_name = os.getenv("OPENAI_MODEL", "")
-    
+
+    effective_row_count = row_count_override if row_count_override is not None else row_count
+
+    # Handle zero-row sheets (e.g., infraction with no infractions)
+    if effective_row_count == 0:
+        return []
+
     # Build context from previously generated sheets
     previous_context = ""
     if previous_sheets_data:
         previous_context = """
 CRITICAL - CROSS-SHEET DATA CONSISTENCY:
 The following sheets have already been generated. You MUST reuse the SAME values for matching/similar fields across sheets.
-For example, if Sheet1 has an address "123 Main St, Dallas, TX 75201", and the current sheet also has address columns, you MUST use the exact same addresses for the corresponding rows.
-Row 1 in this sheet corresponds to Row 1 in all other sheets (same insured/policy/location).
+Row-level correspondence is based on Test Case No matching, NOT row position.
+For Driver/Vehicle/Assignment sheets, expand rows according to the row mapping below.
 
 Fields that MUST stay consistent across sheets include (when the column exists):
-- Names (Insured Name, Contact Name, Agent Name, etc.)
-- Addresses (Street, City, State, ZIP, County)
+- Test Case No (matching prefix determines the test case)
+- Names (first driver Name = Insured Name from Policy)
+- Addresses (Street, City, State, ZIP)
 - Phone numbers, Email addresses
 - Policy numbers, Account numbers
-- Effective dates, Expiration dates
-- SSN, FEIN, Tax ID
-- Any identifier that appears in multiple sheets
-- Data Set (DS_1, DS_2, etc.) must match row-for-row across all sheets
+- Effective dates, Endorsement dates
+- Transaction Type must match the Policy sheet for the same Test Case No prefix
+- Rating State and all state-dependent fields
 
-x generated data:
+Previously generated data:
 """
         for prev_sheet_name, prev_data in previous_sheets_data.items():
             previous_context += f"\n--- Sheet: '{prev_sheet_name}' ---\n"
@@ -257,25 +313,36 @@ x generated data:
         user_instruction_block = "No additional instructions provided."
     date_policy_summary = _build_date_policy_summary(special_instruction)
 
+    # Additional insurance rules
+    insurance_rules_block = ""
+    if additional_rules:
+        insurance_rules_block = f"""
+INSURANCE DOMAIN RULES (MUST FOLLOW):
+{additional_rules}
+"""
+
     prompt = f"""You are a test data generator for US insurance applications.
 
 You are generating data for sheet: "{sheet_name}"
 
-Generate exactly {row_count} rows of realistic test data for the following columns:
+Generate exactly {effective_row_count} rows of realistic test data for the following columns:
 {json.dumps(headers)}
 
 DUPLICATE COLUMN HANDLING:
-Some columns may have a suffix like "(Col X)" — this means the original spreadsheet has multiple columns with the same name. 
+Some columns may have a suffix like "(Col X)" — this means the original spreadsheet has multiple columns with the same name.
 You MUST generate DIFFERENT values for each such column. For example, "Address (Col 3)" and "Address (Col 7)" are two separate columns that need different address values.
 Use ALL column names exactly as provided (including suffixes) as JSON keys.
 
 {previous_context}
 
+{insurance_rules_block}
+
 INSTRUCTION PRIORITY (highest to lowest):
-1. USER SPECIAL INSTRUCTIONS (MUST be followed exactly when relevant):
+1. INSURANCE DOMAIN RULES above (row mappings, sheet-specific rules).
+2. USER SPECIAL INSTRUCTIONS (MUST be followed exactly when relevant):
     {user_instruction_block}
-2. Cross-sheet consistency constraints from previously generated sheets.
-3. Default important rules below (apply ONLY when they do not conflict with user special instructions).
+3. Cross-sheet consistency constraints from previously generated sheets.
+4. Default important rules below (apply ONLY when they do not conflict with above).
 
 DATE POLICY FOR EFFECTIVE/EXPIRATION:
 {date_policy_summary}
@@ -283,24 +350,21 @@ DATE POLICY FOR EFFECTIVE/EXPIRATION:
 IMPORTANT RULES:
 1. Generate realistic US insurance test data
 2. Use valid US formats:
-   - Phone: (XXX) XXX-XXXX
+   - Phone: 1111111111 (10 digits, no dashes or parentheses)
    - SSN: XXX-XX-XXXX (use fake but valid format)
    - ZIP: 5 digits or ZIP+4
-   - State: 2-letter abbreviations (CA, TX, NY, etc.)
-   - Dates: MM/DD/YYYY format
+   - State: 2-letter abbreviations
+   - Dates: MMDDYYYY format (8 digits, NO slashes, NO dashes)
 3. For policy numbers, use realistic formats used in United States.
 4. For currency amounts, use realistic insurance values
 5. Names should be diverse and realistic
-6. Addresses should be realistic US addresses
-7. For vehicles no and other vehicle detail make sure you follow the United States formats.
-8. If no date-specific user instruction is provided, set Effective Date to today's date or one day after today.
-9. If no date-specific user instruction is provided, set Expiration Date to one year after Effective Date.
-10. All the Dollar values should be numbers and not in string. But should have a dollar sign before them.
-11. The Data Set column will always start with DS_1, DS_2. The number will increase for each test case.
-12. The effective date, expiration date should match across all sheets. There should not be mismatch for each test case row.
-13. Row 1 in this sheet corresponds to Row 1 in all other sheets (same insured/policy/location).
+6. Addresses should be realistic US addresses related to the Rating State
+7. For vehicles, use exact data from the VIN table provided in the rules.
+8. All the Dollar values should be numbers and not in string. But should have a dollar sign before them.
+9. The effective date, endorsement date should match across all sheets for same test case.
+10. CRITICAL: Generate EXACTLY {effective_row_count} rows. No more, no less.
 
-Return a JSON object with a single key "data" whose value is an array of {row_count} objects.
+Return a JSON object with a single key "data" whose value is an array of {effective_row_count} objects.
 Each object must use the exact column names as keys.
 No markdown, no explanation, just the JSON object.
 
@@ -319,11 +383,16 @@ Example format:
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are a precise JSON-only data generator for US insurance test datasets. Always return a JSON object with a single key \"data\" containing an array of row objects. If user special instructions conflict with defaults, follow user special instructions."
+                        "content": (
+                            "You are a precise JSON-only data generator for US insurance test datasets. "
+                            "Always return a JSON object with a single key \"data\" containing an array of row objects. "
+                            "If insurance domain rules specify exact row mappings with Test Case No values, follow them EXACTLY. "
+                            "If user special instructions conflict with defaults, follow user special instructions."
+                        ),
                     },
                     {
                         "role": "user",
-                        "content": prompt
+                        "content": prompt,
                     },
                 ],
             )
