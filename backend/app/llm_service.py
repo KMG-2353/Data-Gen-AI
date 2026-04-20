@@ -237,19 +237,24 @@ def configure_openai() -> OpenAI:
 def detect_policy_type(filename: str) -> str:
     """Detect insurance policy type from the uploaded filename.
 
-    Supports:
-      PAP  – Personal Auto Policy
-      MCA  – (future)
+    Filename prefixes (case-insensitive) determine the handler:
+      IMS*  → IMS   (commercial insurance, 9-sheet workbook)
+      PAP*  → PAP   (Personal Auto Policy — Quincy)
+      MCA*  → MCA   (future auto policy type)
+      else  → GENERIC (fallback: preserves baseline main behavior)
 
-    Returns the policy-type string, defaulting to 'PAP' when unrecognised.
+    The returned string is used as the key in policies.get_handler().
     """
-    name = (filename or "").upper()
-    if "PAP" in name:
+    name = (filename or "").strip().upper()
+    # Strip any leading path separators
+    name = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if name.startswith("IMS"):
+        return "IMS"
+    if name.startswith("PAP"):
         return "PAP"
-    if "MCA" in name:
+    if name.startswith("MCA"):
         return "MCA"
-    # Treat any auto-related filename as PAP by default
-    return "PAP"
+    return "GENERIC"
 
 
 # ---------------------------------------------------------------------------

@@ -7,8 +7,8 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from app.llm_service import generate_test_data, detect_sheet_type, build_insurance_context, detect_policy_type
-from app.assignment_logic import build_assignment_rows
+from app.llm_service import generate_test_data, detect_policy_type
+from app.policies import get_handler
 
 load_dotenv()
 
@@ -117,6 +117,8 @@ async def generate_data(request: dict):
     original_headers_by_sheet = sessions[session_id]["headers_by_sheet"]
     filename = sessions[session_id].get("filename", "")
     policy_type = detect_policy_type(filename)
+    handler = get_handler(policy_type)
+    print(f"Detected policy_type={policy_type} for filename='{filename}'")
 
     try:
         # Generate data for ALL sheets sequentially, passing previous data for consistency
@@ -134,52 +136,44 @@ async def generate_data(request: dict):
         sheet_items = list(unique_headers_by_sheet.items())
         non_assignment_sheets = [
             (name, hdrs) for name, hdrs in sheet_items
-            if detect_sheet_type(name) != "assignment"
+            if handler.detect_sheet_type(name) != "assignment"
         ]
         assignment_sheets = [
             (name, hdrs) for name, hdrs in sheet_items
-            if detect_sheet_type(name) == "assignment"
+            if handler.detect_sheet_type(name) == "assignment"
         ]
 
         for sheet_name, unique_headers in non_assignment_sheets + assignment_sheets:
             original_headers = original_headers_by_sheet[sheet_name]
 
-            # Determine insurance-aware row count and rules
-            sheet_type = detect_sheet_type(sheet_name)
-            effective_row_count = row_count
-            additional_rules = ""
-
-            if policy_data is not None or sheet_type == "policy":
-                effective_row_count, additional_rules = build_insurance_context(
-                    sheet_name=sheet_name,
-                    policy_data=policy_data,
-                    driver_data=driver_data,
-                    original_row_count=row_count,
-                    policy_type=policy_type,
-                )
+            # Handler decides row count and sheet-specific prompt augmentation
+            sheet_type = handler.detect_sheet_type(sheet_name)
+            effective_row_count, additional_rules = handler.build_sheet_context(
+                sheet_name=sheet_name,
+                policy_data=policy_data,
+                driver_data=driver_data,
+                original_row_count=row_count,
+                special_instruction=special_instructions,
+            )
 
             print(f"Generating {effective_row_count} rows for sheet '{sheet_name}' (type={sheet_type}) with headers: {unique_headers}")
 
-            # --- Deterministic assignment sheet generation ---
-            if (
-                sheet_type == "assignment"
-                and driver_data
-                and vehicle_data
-                and policy_data
-            ):
-                print(f"Using deterministic assignment algorithm for sheet '{sheet_name}'")
-                data = build_assignment_rows(
-                    driver_data=driver_data,
-                    vehicle_data=vehicle_data,
-                    policy_data=policy_data,
-                    assignment_headers=unique_headers,
-                )
+            # Deterministic pre-generation path (e.g. PAP assignment sheet).
+            pre_generated = handler.pre_generate(
+                sheet_name=sheet_name,
+                unique_headers=unique_headers,
+                policy_data=policy_data,
+                driver_data=driver_data,
+                vehicle_data=vehicle_data,
+            )
 
-            # Handle zero-row sheets (e.g., infraction with no infractions)
+            if pre_generated is not None:
+                print(f"Using deterministic pre-generation for sheet '{sheet_name}'")
+                data = pre_generated
             elif effective_row_count == 0:
+                # Zero-row sheets (e.g. infraction with no drivers flagged)
                 data = []
             else:
-                # Send unique (deduplicated) headers to LLM
                 data = generate_test_data(
                     headers=unique_headers,
                     row_count=row_count,
