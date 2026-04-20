@@ -29,3 +29,7 @@ __pycache__/
 *.njsproj
 *.sln
 *.sw?
+CLAUDE.md
+implementation-plan.md
+*.plan
+plan/
