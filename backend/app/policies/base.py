@@ -61,6 +61,7 @@ class PolicyHandler(Protocol):
         rows: list[dict[str, Any]],
         sheet_name: str,
         special_instruction: str,
+        previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]]:
         """Enforce hard constraints deterministically after LLM generation."""
         ...

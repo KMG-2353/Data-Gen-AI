@@ -40,7 +40,8 @@ class GenericHandler:
         rows: list[dict[str, Any]],
         sheet_name: str,
         special_instruction: str,
+        previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]]:
-        from app.llm_service import _enforce_effective_expiration_date_range
-
-        return _enforce_effective_expiration_date_range(rows, special_instruction)
+        # Date enforcement already runs inside generate_test_data for the
+        # generic path; nothing further to do here.
+        return rows
