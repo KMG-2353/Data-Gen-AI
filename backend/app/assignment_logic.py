@@ -172,13 +172,24 @@ def build_assignment_rows(
 
     # ------------------------------------------------------------------
     # 3. Group vehicle rows by transaction group (TS-XX-YY)
+    #    Track each vehicle's 1-based position (from its TC suffix) so we
+    #    can map ordinals to the correct Veh# column with no gaps.
     # ------------------------------------------------------------------
     vehicle_groups: dict[str, list[dict[str, Any]]] = {}
     for veh in vehicle_data:
         tc_no = _get_field(veh, "test case no", "test case #")
         veh_type = _get_field(veh, "veh type", "vehicle type")
         grp = get_transaction_group(tc_no) or tc_no
-        vehicle_groups.setdefault(grp, []).append({"veh_type": veh_type})
+        parts = str(tc_no).strip().split("-")
+        try:
+            veh_pos = int(parts[-1])  # 1-indexed position within test case
+        except (ValueError, IndexError):
+            veh_pos = len(vehicle_groups.get(grp, [])) + 1
+        vehicle_groups.setdefault(grp, []).append({"veh_type": veh_type, "veh_pos": veh_pos})
+
+    # Sort each group by vehicle position so ordinals are assigned in order
+    for grp in vehicle_groups:
+        vehicle_groups[grp].sort(key=lambda x: x.get("veh_pos", 0))
 
     # ------------------------------------------------------------------
     # 4. Determine maximum vehicle column index from headers
@@ -197,6 +208,17 @@ def build_assignment_rows(
     for grp, drivers_in_group in driver_groups.items():
         vehicles_in_group = vehicle_groups.get(grp, [])
         txn_type = policy_lookup.get(grp, "")
+
+        # Build eligible-vehicle position map:
+        #   veh_col_number (1-based) → ordinal_index (0-based into assignments list)
+        # Only Private Passenger and Classic vehicles get ordinals; others get blank.
+        eligible_col_map: dict[int, int] = {}
+        ordinal_idx = 0
+        for v in vehicles_in_group:
+            pos = v.get("veh_pos", 0)
+            if is_eligible_vehicle(v.get("veh_type", "")):
+                eligible_col_map[pos] = ordinal_idx
+                ordinal_idx += 1
 
         # Build typed input for compute_assignment_matrix
         drivers_input: list[dict[str, Any]] = []
@@ -223,8 +245,12 @@ def build_assignment_rows(
                 # Vehicle column  (Veh #1, Veh #2, …)
                 veh_match = re.match(r"veh\s*#\s*(\d+)", h_strip, re.IGNORECASE)
                 if veh_match:
-                    idx = int(veh_match.group(1)) - 1  # 0-based
-                    row_dict[header] = assignments[idx] if idx < len(assignments) else ""
+                    veh_col = int(veh_match.group(1))  # 1-based column number
+                    if veh_col in eligible_col_map:
+                        ord_idx = eligible_col_map[veh_col]
+                        row_dict[header] = assignments[ord_idx] if ord_idx < len(assignments) else ""
+                    else:
+                        row_dict[header] = ""  # ineligible vehicle column → blank
                     continue
 
                 # Test Case number column

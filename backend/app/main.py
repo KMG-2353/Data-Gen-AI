@@ -7,7 +7,7 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from app.llm_service import generate_test_data, detect_sheet_type, build_insurance_context
+from app.llm_service import generate_test_data, detect_sheet_type, build_insurance_context, detect_policy_type
 from app.assignment_logic import build_assignment_rows
 
 load_dotenv()
@@ -115,7 +115,9 @@ async def generate_data(request: dict):
     
     unique_headers_by_sheet = sessions[session_id]["unique_headers_by_sheet"]
     original_headers_by_sheet = sessions[session_id]["headers_by_sheet"]
-    
+    filename = sessions[session_id].get("filename", "")
+    policy_type = detect_policy_type(filename)
+
     try:
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
@@ -153,6 +155,7 @@ async def generate_data(request: dict):
                     policy_data=policy_data,
                     driver_data=driver_data,
                     original_row_count=row_count,
+                    policy_type=policy_type,
                 )
 
             print(f"Generating {effective_row_count} rows for sheet '{sheet_name}' (type={sheet_type}) with headers: {unique_headers}")
