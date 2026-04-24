@@ -14,6 +14,30 @@ import {
 import FileUpload from "./components/ui/upload.tsx";
 import { apiConfig } from "./config/api";
 
+const MULTILINE_LOBS = [
+	"Inland Marine",
+	"Crime",
+	// "General Liability",
+	// "Optional Coverage",
+	// "Commercial Auto",
+	"Property",
+];
+const MONOLINE_LOBS = ["GL", "Personal Auto Policy"];
+const US_STATES = [
+	"CA",
+	"TX",
+	"FL",
+	"NY",
+	"PA",
+	"IL",
+	"OH",
+	"GA",
+	"NC",
+	"MI",
+	"ME",
+	"MA",
+];
+
 function App() {
 	const [headersBySheet, setHeadersBySheet] = useState<
 		Record<string, string[]>
@@ -24,9 +48,11 @@ function App() {
 	const [isUploading, setIsUploading] = useState(false);
 	const [isGenerating, setIsGenerating] = useState(false);
 	const [lineOfBusiness, setLineOfBusiness] = useState<string>("");
-	const [coverage, setCoverage] = useState<string>("");
+	const [selectedLobs, setSelectedLobs] = useState<string[]>([]);
+	const [selectedStates, setSelectedStates] = useState<string[]>([]);
 	const [testCases, setTestCases] = useState(5);
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
+
 	const handleFileSelect = async (file: File) => {
 		setIsUploading(true);
 		setGeneratedSheets(null);
@@ -70,6 +96,9 @@ function App() {
 					session_id: sessionId,
 					row_count: testCases,
 					special_inst: sepcialinstruction,
+					lob_type: lineOfBusiness,
+					lob_selection: selectedLobs,
+					state_selection: selectedStates,
 				}),
 			});
 
@@ -100,6 +129,29 @@ function App() {
 		document.body.removeChild(a);
 		URL.revokeObjectURL(url);
 	};
+
+	const toggleLob = (lob: string) => {
+		if (lineOfBusiness === "Monoline") {
+			setSelectedLobs([lob]);
+		} else {
+			setSelectedLobs((prev) =>
+				prev.includes(lob) ? prev.filter((l) => l !== lob) : [...prev, lob],
+			);
+		}
+	};
+
+	const toggleState = (state: string) => {
+		setSelectedStates((prev) =>
+			prev.includes(state) ? prev.filter((s) => s !== state) : [...prev, state],
+		);
+	};
+
+	const lobOptions =
+		lineOfBusiness === "Monoline"
+			? MONOLINE_LOBS
+			: lineOfBusiness === "Multiline"
+				? MULTILINE_LOBS
+				: [];
 
 	return (
 		<div className="flex h-screen m-auto w-1/2 max-w-2xl justify-center items-center flex-col gap-5 p-8">
@@ -150,68 +202,83 @@ function App() {
 					min={1}
 					max={500}
 				/>
-				<div className="w-full flex gap-3">
-					<Select
-						value={lineOfBusiness}
-						onValueChange={(val) => {
-							setLineOfBusiness(val);
-							setCoverage("");
-						}}
-					>
-						<SelectTrigger className="w-full max-w-48">
-							<SelectValue placeholder="Select LOB" />
-						</SelectTrigger>
-						<SelectContent>
-							<SelectGroup>
-								<SelectLabel>Select LOB</SelectLabel>
-								<SelectItem value="Monoline">Monoline</SelectItem>
-								<SelectItem value="Multiline">Multiline</SelectItem>
-							</SelectGroup>
-						</SelectContent>
-					</Select>
 
-					{lineOfBusiness && (
-						<Select value={coverage} onValueChange={setCoverage}>
-							{lineOfBusiness === "Monoline" ? (
-								<SelectTrigger className="w-full max-w-56">
-									<SelectValue placeholder="Select" />
-								</SelectTrigger>
-							) : (
-								<SelectTrigger className="w-full max-w-56">
-									<SelectValue placeholder="Select Multiple" />
-								</SelectTrigger>
-							)}
+				{/* LOB type selector */}
+				<Select
+					value={lineOfBusiness}
+					onValueChange={(val) => {
+						setLineOfBusiness(val);
+						setSelectedLobs([]);
+					}}
+				>
+					<SelectTrigger className="w-full max-w-48">
+						<SelectValue placeholder="Select LOB Type" />
+					</SelectTrigger>
+					<SelectContent>
+						<SelectGroup>
+							<SelectLabel>Line of Business</SelectLabel>
+							<SelectItem value="Monoline">Monoline</SelectItem>
+							<SelectItem value="Multiline">Multiline</SelectItem>
+						</SelectGroup>
+					</SelectContent>
+				</Select>
 
-							<SelectContent>
-								<SelectGroup>
-									{lineOfBusiness === "Monoline" ? (
-										<div>
-											<SelectLabel>Select</SelectLabel>
-											<SelectItem value="GL">GL</SelectItem>
-										</div>
-									) : (
-										<>
-											<SelectLabel>Select Multi</SelectLabel>
-											<SelectItem value="Inline Marine">
-												Inline Marine
-											</SelectItem>
-											<SelectItem value="Crime">Crime</SelectItem>
-											<SelectItem value="General Liability">
-												General Liability
-											</SelectItem>
-											<SelectItem value="Optional Coverage">
-												Optional Coverage
-											</SelectItem>
-											<SelectItem value="Commercial Auto">
-												Commercial Auto
-											</SelectItem>
-										</>
-									)}
-								</SelectGroup>
-							</SelectContent>
-						</Select>
-					)}
+				{/* LOB toggle buttons */}
+				{lobOptions.length > 0 && (
+					<div className="w-full flex flex-col gap-2">
+						<p className="text-xs text-gray-500">
+							{lineOfBusiness === "Monoline"
+								? "Select one LOB"
+								: "Select one or more LOBs (optional — defaults to random if none selected)"}
+						</p>
+						<div className="flex flex-wrap gap-2">
+							{lobOptions.map((lob) => {
+								const active = selectedLobs.includes(lob);
+								return (
+									<button
+										key={lob}
+										type="button"
+										onClick={() => toggleLob(lob)}
+										className={`px-3 py-1 rounded-full text-xs border transition-colors ${
+											active
+												? "bg-gray-800 text-white border-gray-800"
+												: "bg-white text-gray-700 border-gray-300 hover:border-gray-500"
+										}`}
+									>
+										{lob}
+									</button>
+								);
+							})}
+						</div>
+					</div>
+				)}
+
+				{/* State selector */}
+				<div className="w-full flex flex-col gap-2">
+					<p className="text-xs text-gray-500">
+						Select states (optional — defaults to diverse if none selected)
+					</p>
+					<div className="flex flex-wrap gap-2">
+						{US_STATES.map((state) => {
+							const active = selectedStates.includes(state);
+							return (
+								<button
+									key={state}
+									type="button"
+									onClick={() => toggleState(state)}
+									className={`px-3 py-1 rounded-full text-xs border transition-colors ${
+										active
+											? "bg-gray-800 text-white border-gray-800"
+											: "bg-white text-gray-700 border-gray-300 hover:border-gray-500"
+									}`}
+								>
+									{state}
+								</button>
+							);
+						})}
+					</div>
 				</div>
+
 				<TextareaAutoGrowDemo
 					value={sepcialinstruction}
 					inputchange={setSepcialinstruction}

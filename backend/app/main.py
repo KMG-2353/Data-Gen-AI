@@ -7,12 +7,14 @@ import uuid
 import os
 from dotenv import load_dotenv
 
-from app.llm_service import generate_test_data, detect_policy_type
+from app.llm_service import generate_test_data, detect_policy_type, detect_policy_type_from_headers
 from app.policies import get_handler
 from app.policies.ims import (
     canonical_sheet_name as _ims_canonical_sheet_name,
     extract_lob_flags as _ims_extract_lob_flags,
     filter_rows_by_lob as _ims_filter_rows_by_lob,
+    enforce_lob_selection as _ims_enforce_lob_selection,
+    enforce_state_selection as _ims_enforce_state_selection,
 )
 
 load_dotenv()
@@ -95,6 +97,11 @@ async def upload_file(file: UploadFile = File(...)):
         if not headers_by_sheet:
             raise HTTPException(status_code=400, detail="No headers found in any sheet")
 
+        # Detect policy type from headers (primary); filename is kept as fallback
+        detected_policy_type = detect_policy_type_from_headers(headers_by_sheet)
+        if detected_policy_type == "GENERIC":
+            detected_policy_type = detect_policy_type(file.filename)
+
         # Generate session ID
         session_id = str(uuid.uuid4())
 
@@ -102,7 +109,8 @@ async def upload_file(file: UploadFile = File(...)):
         sessions[session_id] = {
             "headers_by_sheet": headers_by_sheet,
             "unique_headers_by_sheet": unique_headers_by_sheet,
-            "filename": file.filename
+            "filename": file.filename,
+            "policy_type": detected_policy_type,
         }
 
         return {
@@ -121,16 +129,62 @@ async def generate_data(request: dict):
     """Generate test data using LLM for all sheets"""
     session_id = request.get("session_id")
     row_count = request.get("row_count", 10)
-    special_instructions=request.get("special_inst","")
+    special_instructions = request.get("special_inst", "")
+    lob_selection: list[str] = request.get("lob_selection", [])   # e.g. ["Crime", "General Liability"]
+    state_selection: list[str] = request.get("state_selection", [])  # e.g. ["CA", "TX"]
+
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
 
     unique_headers_by_sheet = sessions[session_id]["unique_headers_by_sheet"]
     original_headers_by_sheet = sessions[session_id]["headers_by_sheet"]
     filename = sessions[session_id].get("filename", "")
-    policy_type = detect_policy_type(filename)
+
+    # Use header-based detection stored at upload time.
+    # If not stored (session created before code update) re-detect from headers.
+    policy_type = sessions[session_id].get("policy_type")
+    if not policy_type:
+        policy_type = detect_policy_type_from_headers(unique_headers_by_sheet)
+        if policy_type == "GENERIC":
+            policy_type = detect_policy_type(filename)
+        # Cache it so subsequent generate calls for same session are fast
+        sessions[session_id]["policy_type"] = policy_type
     handler = get_handler(policy_type)
     print(f"Detected policy_type={policy_type} for filename='{filename}'")
+
+    # -------------------------------------------------------------------------
+    # Build augmented_special: user instructions + UI-level LOB/state hints.
+    # LOB selection is injected at the TOP so it sits inside USER SPECIAL
+    # INSTRUCTIONS in the LLM prompt.  Special instructions from the text box
+    # always take precedence because they are written AFTER the LOB hint.
+    # -------------------------------------------------------------------------
+    augmented_special = special_instructions or ""
+
+    # LOB selection hint — injected BEFORE user text so user text can still override.
+    # Format: individual "LOBName = Yes/No" lines so parse_special_instructions
+    # regex (lob_name\s*=\s*yes) can correctly populate pi.active_lobs.
+    if lob_selection and policy_type == "IMS":
+        all_ims_lobs = [
+            "General Liability", "Property", "Crime",
+            "Inland Marine", "Commercial Auto", "Optional Coverage",
+        ]
+        selected_lower = {s.lower().strip() for s in lob_selection}
+        lob_lines = []
+        for lob in all_ims_lobs:
+            val = "Yes" if lob.lower() in selected_lower else "No"
+            lob_lines.append(f"{lob} = {val}")
+        lob_hint = "SELECTED LOBs (Policy sheet): " + ", ".join(lob_lines) + "."
+        augmented_special = f"{lob_hint}\n{augmented_special}".strip()
+
+    # State selection hint — format matches the parse_special_instructions regex:
+    # (?:only|for|states?)[:\s]+([A-Z]{2}...)  so pi.allowed_states gets populated
+    # and the STRUCTURED CONSTRAINTS block outputs "STATES: Only generate data for: ..."
+    if state_selection:
+        states_str = ", ".join(state_selection)
+        si_lower = augmented_special.lower()
+        if not any(s.lower() in si_lower for s in state_selection):
+            state_hint = f"states: {states_str}."
+            augmented_special = f"{augmented_special}\n{state_hint}".strip() if augmented_special else state_hint
 
     try:
         # Generate data for ALL sheets sequentially, passing previous data for consistency
@@ -169,7 +223,7 @@ async def generate_data(request: dict):
                 policy_data=policy_data,
                 driver_data=driver_data,
                 original_row_count=row_count,
-                special_instruction=special_instructions,
+                special_instruction=augmented_special,
             )
 
             print(f"Generating {effective_row_count} rows for sheet '{sheet_name}' (type={sheet_type}) with headers: {unique_headers}")
@@ -193,7 +247,7 @@ async def generate_data(request: dict):
                 data = generate_test_data(
                     headers=unique_headers,
                     row_count=row_count,
-                    special_instruction=special_instructions,
+                    special_instruction=augmented_special,
                     sheet_name=sheet_name,
                     previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
                     row_count_override=effective_row_count,
@@ -205,13 +259,17 @@ async def generate_data(request: dict):
             data = handler.post_process(
                 rows=data,
                 sheet_name=sheet_name,
-                special_instruction=special_instructions,
+                special_instruction=augmented_special,
                 previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
             )
 
             # IMS: once the Policy sheet is done, extract LOB flags so later
             # sub-sheets can be filtered (Defect #216: LOB=No → drop row).
             if policy_type == "IMS" and sheet_type == "policy":
+                # Enforce UI LOB selection before extracting flags (special instructions win)
+                if lob_selection:
+                    data = _ims_enforce_lob_selection(data, lob_selection, special_instructions)
+                    print(f"LOB selection enforced on '{sheet_name}': {lob_selection}")
                 lob_flags = _ims_extract_lob_flags(data)
                 print(f"Extracted LOB flags from '{sheet_name}': {len(lob_flags)} rows")
 
@@ -224,6 +282,12 @@ async def generate_data(request: dict):
                         f"LOB filtering: removed {original_count - len(data)} "
                         f"rows from '{sheet_name}' (LOB=No)"
                     )
+
+            # IMS: deterministically enforce state selection across all sheets.
+            # This is a hard post-processing step — LLM prompt alone is unreliable.
+            if policy_type == "IMS" and state_selection and data:
+                data = _ims_enforce_state_selection(data, sheet_name, state_selection)
+                print(f"State selection enforced on '{sheet_name}': {state_selection}")
 
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,

@@ -155,6 +155,19 @@ def parse_special_instructions(text: str, row_count: int = 0) -> ParsedInstructi
                               "same address allowed"]):
         pi.unique_addresses = False
 
+    # Parse LOB selection injected by the UI.
+    # Format: "SELECTED LOBs (Policy sheet): General Liability = No, Crime = Yes, ..."
+    # Each LOB has its own "LOBName = Yes/No" token so we can parse exactly.
+    _KNOWN_IMS_LOBS = [
+        "general liability", "property", "crime",
+        "inland marine", "commercial auto", "optional coverage",
+    ]
+    if "selected lob" in t:
+        for lob_name in _KNOWN_IMS_LOBS:
+            pattern = re.escape(lob_name) + r"\s*=\s*yes"
+            if re.search(pattern, t):
+                pi.active_lobs.append(lob_name)
+
     return pi
 
 
@@ -712,6 +725,78 @@ _VALID_IMS_PRODUCERS = [
 ]
 
 
+_STATE_ABBREV_TO_NAME: dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+
+
+def enforce_state_selection(
+    rows: list[dict[str, Any]],
+    sheet_name: str,
+    selected_states: list[str],
+) -> list[dict[str, Any]]:
+    """Deterministically overwrite state columns with the user-selected states.
+
+    IMS SCREEN uses full state names (col J); other sheets use 2-letter codes.
+    States are distributed round-robin across rows so coverage is even.
+    """
+    if not selected_states or not rows:
+        return rows
+
+    sn = sheet_name.lower().strip()
+    is_ims_screen = "ims" in sn and "screen" in sn
+
+    # Normalise selected_states to uppercase abbreviations
+    abbrevs = [s.strip().upper() for s in selected_states if s.strip()]
+    if not abbrevs:
+        return rows
+
+    # For IMS SCREEN we need full names; for other sheets keep abbreviations
+    if is_ims_screen:
+        state_values = [_STATE_ABBREV_TO_NAME.get(a, a) for a in abbrevs]
+    else:
+        state_values = abbrevs
+
+    # Find the state column key in the row (avoid "registration state", "state code", etc.)
+    def _find_state_key(row: dict) -> str | None:
+        # Priority 1: exact "state" key
+        for k in row:
+            if k.lower().strip() == "state":
+                return k
+        # Priority 2: key that IS "state" with a column suffix like "State (Col 10)"
+        for k in row:
+            kl = k.lower().strip()
+            if kl.startswith("state (col "):
+                return k
+        # Priority 3: key that starts with "state" but is not a compound like "statewide"
+        for k in row:
+            kl = k.lower().strip()
+            if kl.startswith("state") and "registration" not in kl and len(kl) <= 20:
+                return k
+        return None
+
+    result = []
+    for idx, row in enumerate(rows):
+        new_row = dict(row)
+        state_key = _find_state_key(new_row)
+        if state_key:
+            new_row[state_key] = state_values[idx % len(state_values)]
+        result.append(new_row)
+    return result
+
+
 def _enforce_ims_screen_values(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in rows:
         for k in list(row.keys()):
@@ -862,6 +947,8 @@ LOB_SHEET_MAP = {
     "crime": ["crime"],
     "inland marine": ["inland marine", "inland"],
     "commercial auto": ["commercial auto", "comm auto", "auto"],
+    "general liability": ["general liability", "netrate general liability"],
+    "optional coverage": ["optional coverage", "opt coverage"],
 }
 
 _LOB_HEADER_VARIANTS: dict[str, list[str]] = {
@@ -869,6 +956,19 @@ _LOB_HEADER_VARIANTS: dict[str, list[str]] = {
     "crime": ["crime"],
     "inland marine": ["inland marine", "inland"],
     "commercial auto": ["commercial auto", "comm auto"],
+    "general liability": ["general liability"],
+    "optional coverage": ["optional coverage"],
+}
+
+# Frontend LOB names → canonical internal names (case-insensitive matching)
+_FRONTEND_LOB_MAP: dict[str, str] = {
+    "inland marine": "inland marine",
+    "crime": "crime",
+    "general liability": "general liability",
+    "gl": "general liability",
+    "optional coverage": "optional coverage",
+    "commercial auto": "commercial auto",
+    "property": "property",
 }
 
 _AUTO_FALSE_POSITIVES = {"auto-", "automobile", "automatic"}
@@ -877,6 +977,18 @@ _AUTO_FALSE_POSITIVES = {"auto-", "automobile", "automatic"}
 def _find_lob_key(row: dict[str, Any], lob_name: str) -> str | None:
     variants = _LOB_HEADER_VARIANTS.get(lob_name, [lob_name])
     row_keys = list(row.keys())
+
+    # Pass 1: exact match or exact match with "(Col N)" deduplication suffix.
+    # This prevents "property" from matching "deductible property damage", etc.
+    for variant in variants:
+        for k in row_keys:
+            kl = k.lower().strip()
+            if kl == variant:
+                return k
+            if kl.startswith(variant + " (col "):
+                return k
+
+    # Pass 2: substring fallback (kept for edge cases with unusual header names)
     for variant in variants:
         for k in row_keys:
             kl = k.lower().strip()
@@ -929,20 +1041,98 @@ def filter_rows_by_lob(
     return filtered
 
 
+def enforce_lob_selection(
+    policy_data: list[dict[str, Any]],
+    selected_lobs: list[str],
+    special_instructions: str = "",
+) -> list[dict[str, Any]]:
+    """Override LOB Yes/No columns in Policy rows based on UI selection.
+
+    selected_lobs: LOB names from the frontend (e.g., ["Crime", "General Liability"]).
+    Special instructions only block a LOB override when they contain an EXPLICIT
+    Yes/No directive for that LOB (e.g. "crime = no", "property: yes").
+    If selected_lobs is empty, returns data unchanged (random LLM output is kept).
+    """
+    if not selected_lobs:
+        return policy_data
+
+    # Map frontend LOB names → canonical internal keys
+    selected_canonical: set[str] = set()
+    for lob in selected_lobs:
+        canon = _FRONTEND_LOB_MAP.get(lob.lower().strip())
+        if canon:
+            selected_canonical.add(canon)
+
+    # Determine which LOBs have an EXPLICIT override in special instructions
+    # (e.g. "crime = no", "property: yes") — only those are left untouched.
+    si_lower = (special_instructions or "").lower()
+    si_overridden: set[str] = set()
+    for lob_name in _LOB_HEADER_VARIANTS:
+        pattern = re.escape(lob_name) + r"\s*[=:]\s*(yes|no)"
+        if re.search(pattern, si_lower):
+            si_overridden.add(lob_name)
+
+    # Build a flat lookup: lowercased column name → target "Yes"/"No"
+    # Covers every variant in _LOB_HEADER_VARIANTS that is NOT overridden.
+    col_value_map: dict[str, str] = {}
+    for lob_name, variants in _LOB_HEADER_VARIANTS.items():
+        if lob_name in si_overridden:
+            continue
+        value = "Yes" if lob_name in selected_canonical else "No"
+        for v in variants:
+            col_value_map[v] = value  # exact lowercased variant → Yes/No
+
+    result = []
+    for row in policy_data:
+        new_row = dict(row)
+        for k in list(new_row.keys()):
+            kl = k.lower().strip()
+            # Exact match (e.g. "general liability")
+            if kl in col_value_map:
+                new_row[k] = col_value_map[kl]
+                continue
+            # Deduplicated header with "(Col N)" suffix
+            for variant, val in col_value_map.items():
+                if kl.startswith(variant + " (col "):
+                    new_row[k] = val
+                    break
+        result.append(new_row)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
 
-def _per_sheet_reminder(sheet_name: str) -> str:
+def _per_sheet_reminder(sheet_name: str, special_instruction: str = "") -> str:
     sn = sheet_name.lower().strip()
+    si = special_instruction.lower()
     notes: list[str] = []
 
     if "policy" in sn:
+        # Determine whether the user has passed an explicit LOB selection.
+        # The UI injects "SELECTED LOBs (Policy sheet): ..." into special_instruction.
+        _all_lobs = [
+            "general liability", "property", "crime",
+            "inland marine", "commercial auto", "optional coverage",
+        ]
+        has_lob_selection = "selected lob" in si
+        if has_lob_selection:
+            # Build per-LOB directives from the selection hint already in the prompt
+            gl_directive = "'Yes' if it appears in the SELECTED LOBs list, otherwise 'No'"
+            lob_directive = (
+                "Follow the SELECTED LOBs in the special instructions EXACTLY. "
+                "Set each LOB column to 'Yes' or 'No' as specified. Never leave blank."
+            )
+        else:
+            gl_directive = "ALWAYS 'Yes'"
+            lob_directive = "default to 'Yes' unless the user says otherwise. Never leave these blank."
+
         notes += [
             "• Company and Program columns: ALWAYS 'NetRate'.",
             "• Rate and Rules columns: ALWAYS equal the Effective Date value.",
-            "• General Liability column: ALWAYS 'Yes'. Excess Liability: ALWAYS 'No'. Umbrella: ALWAYS 'No'.",
-            "• Property / Crime / Inland Marine / Commercial Auto LOB columns: default to 'Yes' unless the user says otherwise. Never leave these blank.",
+            f"• General Liability column: {gl_directive}. Excess Liability: ALWAYS 'No'. Umbrella: ALWAYS 'No'.",
+            f"• Property / Crime / Inland Marine / Commercial Auto LOB columns: {lob_directive}",
             "• Corporation column: ALWAYS 'Corporation'.",
             "• Protection Class: MUST be an integer from 1 to 10.",
             "• Property Damage Deductible: pick from dropdown 250, 500, 1000, 2500, 5000, 10000, 25000, 50000, 100000.",
@@ -1032,6 +1222,15 @@ def _build_configurable_constraints(pi: ParsedInstructions) -> str:
         lines.append("PERCENTAGES: Use % symbol strings (e.g. '2%').")
     else:
         lines.append("PERCENTAGES: Use decimal fractions (e.g. 0.02 for 2%).")
+    if pi.active_lobs:
+        _all = ["general liability", "property", "crime",
+                "inland marine", "commercial auto", "optional coverage"]
+        off = [l.title() for l in _all if l not in pi.active_lobs]
+        on  = [l.title() for l in pi.active_lobs]
+        lines.append(
+            f"LOB COLUMNS (Policy sheet): Set {', '.join(on)} = Yes. "
+            f"Set {', '.join(off)} = No."
+        )
     return "\n".join(f"  • {line}" for line in lines)
 
 
@@ -1074,7 +1273,7 @@ class ImsHandler:
     ) -> tuple[int, str]:
         pi = parse_special_instructions(special_instruction, row_count=original_row_count)
         constraints = _build_configurable_constraints(pi)
-        reminder = _per_sheet_reminder(sheet_name)
+        reminder = _per_sheet_reminder(sheet_name, special_instruction)
         extras = f"\nSTRUCTURED CONSTRAINTS:\n{constraints}{reminder}"
         return original_row_count, extras
 

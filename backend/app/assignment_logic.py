@@ -73,6 +73,27 @@ def _get_field(row: dict[str, Any], *candidates: str) -> str:
     return ""
 
 
+def _get_tc_field(row: dict[str, Any]) -> str:
+    """Get the Test Case No value, handling column header variants.
+
+    Matches 'Test Case No', 'Test Case #', 'Test Case Number', 'Test Case'
+    (bare form) but deliberately skips 'Test Case Details', 'Test Case Description',
+    etc. to avoid returning the wrong column.
+    """
+    # Pass 1: exact match on known variants (fastest, most precise)
+    _EXACT = {"test case no", "test case #", "test case number", "test case"}
+    for key, val in row.items():
+        if key.lower().strip() in _EXACT:
+            return str(val).strip() if val is not None else ""
+    # Pass 2: starts-with 'test case' but excludes columns like 'test case details'
+    _EXCLUDE = ("detail", "description", "type", "status", "note")
+    for key, val in row.items():
+        kl = key.lower().strip()
+        if kl.startswith("test case") and not any(exc in kl for exc in _EXCLUDE):
+            return str(val).strip() if val is not None else ""
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Core assignment matrix computation
 # ---------------------------------------------------------------------------
@@ -156,7 +177,7 @@ def build_assignment_rows(
     # ------------------------------------------------------------------
     policy_lookup: dict[str, str] = {}
     for row in policy_data:
-        tc = _get_field(row, "test case no", "test case #")
+        tc = _get_tc_field(row)
         txn_type = _get_field(row, "transaction type")
         if tc:
             policy_lookup[tc] = txn_type
@@ -166,7 +187,7 @@ def build_assignment_rows(
     # ------------------------------------------------------------------
     driver_groups: dict[str, list[dict[str, Any]]] = {}
     for dr in driver_data:
-        tc_no = _get_field(dr, "test case no", "test case #")
+        tc_no = _get_tc_field(dr)
         grp = get_transaction_group(tc_no) or tc_no
         driver_groups.setdefault(grp, []).append(dr)
 
@@ -177,7 +198,7 @@ def build_assignment_rows(
     # ------------------------------------------------------------------
     vehicle_groups: dict[str, list[dict[str, Any]]] = {}
     for veh in vehicle_data:
-        tc_no = _get_field(veh, "test case no", "test case #")
+        tc_no = _get_tc_field(veh)
         veh_type = _get_field(veh, "veh type", "vehicle type")
         grp = get_transaction_group(tc_no) or tc_no
         parts = str(tc_no).strip().split("-")
@@ -225,7 +246,7 @@ def build_assignment_rows(
         for dr in drivers_in_group:
             drivers_input.append(
                 {
-                    "test_case": _get_field(dr, "test case no", "test case #"),
+                    "test_case": _get_tc_field(dr),
                     "transaction_type": txn_type,
                     "name": _get_field(dr, "name"),
                     "driver_type": _get_field(dr, "driver type"),
@@ -254,7 +275,7 @@ def build_assignment_rows(
                     continue
 
                 # Test Case number column
-                if "test case" in h_lower:
+                if "test case" in h_lower and "detail" not in h_lower:
                     row_dict[header] = matrix_row.get("test_case", "")
                     continue
 
@@ -314,7 +335,7 @@ def build_assignment_prompt_instructions(
         if vehicle_data:
             eligible = [
                 v for v in vehicle_data
-                if get_transaction_group(_get_field(v, "test case no", "test case #")) == grp
+                if get_transaction_group(_get_tc_field(v)) == grp
                 and is_eligible_vehicle(_get_field(v, "veh type", "vehicle type"))
             ]
             if eligible:

@@ -147,12 +147,20 @@ def _enforce_effective_expiration_date_range(
     rows: list[dict[str, Any]],
     special_instruction: str,
 ) -> list[dict[str, Any]]:
-    """Apply instruction-driven policy for effective/expiration dates."""
+    """Apply instruction-driven policy for effective/expiration dates.
+
+    Key rules enforced deterministically:
+    1. All transactions in the same test case (TS-XX) share the SAME effective date,
+       except Renewal which gets its own date (300+ days in the past).
+    2. For New Business rows: Endorsement Date = Effective Date.
+    3. No slashes or dashes — format is MMDDYYYY (8 digits).
+    """
     from datetime import timedelta
 
     year_range = _extract_effective_expiration_year_range(special_instruction)
     effective_candidates = ["effective date", "effective"]
     expiration_candidates = ["expiration date", "expiry date", "expiry", "expiration", "exp date"]
+    endorsement_candidates = ["endorsement date", "endorsement"]
 
     include_every_year = _include_every_year_requested(special_instruction)
     today = date.today()
@@ -160,64 +168,75 @@ def _enforce_effective_expiration_date_range(
     effective_cycle: list[int] = []
     if year_range:
         start_year, end_year = year_range
-        if end_year - start_year >= 1:
-            effective_cycle = list(range(start_year, end_year + 1))
-        else:
-            effective_cycle = [start_year]
+        effective_cycle = list(range(start_year, end_year + 1)) if end_year > start_year else [start_year]
 
-        if include_every_year and not effective_cycle:
-            effective_cycle = [start_year]
+    # Track effective date per test-case group (TS-XX) so all transactions share
+    # the same date. Renewal always gets its own independently generated date.
+    tc_group_dates: dict[str, date] = {}
 
     for idx, row in enumerate(rows):
         effective_key = _find_header_key(row, effective_candidates)
         expiration_key = _find_header_key(row, expiration_candidates)
+        endorsement_key = _find_header_key(row, endorsement_candidates)
         if not effective_key and not expiration_key:
             continue
 
-        # Check transaction type — Renewal needs effective 300+ days in the past
+        # Extract test case number and derive the group (TS-XX)
+        tc_no = ""
         txn_type = ""
         for key, val in row.items():
-            if "transaction type" in key.lower():
+            kl = key.lower()
+            if "test case no" in kl and not tc_no:
+                tc_no = str(val or "").strip()
+            if "transaction type" in kl and not txn_type:
                 txn_type = str(val or "").strip().lower()
-                break
+
+        # Group = first two dash-separated segments (TS-XX); handles TS-XX-YY-ZZ too
+        parts = tc_no.split("-")
+        tc_group = "-".join(parts[:2]) if len(parts) >= 2 else tc_no
+
         is_renewal = "renewal" in txn_type
+        is_new_business = "new business" in txn_type
 
         if is_renewal:
-            # Renewal: effective date must be >= 300 days in the past
+            # Renewal: 300–400 days in the past (independent per row)
             days_back = random.randint(300, 400)
             effective_dt = today - timedelta(days=days_back)
-            expiration_dt = _add_one_year(effective_dt)
-        elif not year_range and not _has_date_intent(special_instruction):
-            # Default: current date ±60 days
-            offset = random.randint(-60, 60)
-            effective_dt = today + timedelta(days=offset)
-            expiration_dt = _add_one_year(effective_dt)
-        elif year_range:
-            start_year, end_year = year_range
-            if include_every_year and effective_cycle:
-                effective_year = effective_cycle[idx % len(effective_cycle)]
-            else:
-                if end_year - start_year >= 1:
-                    effective_year = random.randint(start_year, end_year)
-                else:
-                    effective_year = start_year
-
-            effective_month = random.randint(1, 12)
-            effective_day = random.randint(1, 28)
-            effective_dt = date(effective_year, effective_month, effective_day)
-            expiration_dt = _add_one_year(effective_dt)
-
-            if expiration_dt.year > end_year:
-                expiration_dt = date(end_year, effective_month, effective_day)
+        elif tc_group in tc_group_dates:
+            # Reuse the date already generated for this test-case group
+            effective_dt = tc_group_dates[tc_group]
         else:
-            offset = random.randint(-60, 60)
-            effective_dt = today + timedelta(days=offset)
-            expiration_dt = _add_one_year(effective_dt)
+            # Generate a new date and cache it for this test-case group
+            if not year_range and not _has_date_intent(special_instruction):
+                offset = random.randint(-60, 60)
+                effective_dt = today + timedelta(days=offset)
+            elif year_range:
+                start_year, end_year = year_range
+                if include_every_year and effective_cycle:
+                    effective_year = effective_cycle[len(tc_group_dates) % len(effective_cycle)]
+                else:
+                    effective_year = random.randint(start_year, end_year)
+                effective_month = random.randint(1, 12)
+                effective_day = random.randint(1, 28)
+                effective_dt = date(effective_year, effective_month, effective_day)
+            else:
+                offset = random.randint(-60, 60)
+                effective_dt = today + timedelta(days=offset)
+
+            tc_group_dates[tc_group] = effective_dt
+
+        expiration_dt = _add_one_year(effective_dt)
+        if year_range and expiration_dt.year > year_range[1]:
+            expiration_dt = date(year_range[1], effective_dt.month, effective_dt.day)
 
         if effective_key:
             row[effective_key] = _format_mmddyyyy(effective_dt)
         if expiration_key:
             row[expiration_key] = _format_mmddyyyy(expiration_dt)
+
+        # For New Business: Endorsement Date must equal Effective Date
+        if is_new_business and endorsement_key:
+            row[endorsement_key] = _format_mmddyyyy(effective_dt)
 
     return rows
 
@@ -235,7 +254,7 @@ def configure_openai() -> OpenAI:
 # ---------------------------------------------------------------------------
 
 def detect_policy_type(filename: str) -> str:
-    """Detect insurance policy type from the uploaded filename.
+    """Detect insurance policy type from the uploaded filename (legacy fallback).
 
     Filename prefixes (case-insensitive) determine the handler:
       IMS*  → IMS   (commercial insurance, 9-sheet workbook)
@@ -243,7 +262,7 @@ def detect_policy_type(filename: str) -> str:
       MCA*  → MCA   (future auto policy type)
       else  → GENERIC (fallback: preserves baseline main behavior)
 
-    The returned string is used as the key in policies.get_handler().
+    Prefer detect_policy_type_from_headers() when headers are available.
     """
     name = (filename or "").strip().upper()
     # Strip any leading path separators
@@ -254,6 +273,51 @@ def detect_policy_type(filename: str) -> str:
         return "PAP"
     if name.startswith("MCA"):
         return "MCA"
+    return "GENERIC"
+
+
+def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
+    """Detect policy type from workbook sheet names and header content.
+
+    Checks sheet names and key header signals in order:
+      1. PAP  — has driver + vehicle + assignment sheets
+      2. IMS  — has 2+ commercial LOB sheets (crime, property, etc.)
+      3. GENERIC — fallback
+
+    This is the primary detection path; filename-based detection is a
+    legacy fallback for sessions that pre-date header storage.
+    """
+    sheets_lower = [s.lower().strip() for s in headers_by_sheet.keys()]
+    all_headers_lower = [
+        h.lower().strip()
+        for hdrs in headers_by_sheet.values()
+        for h in hdrs
+    ]
+
+    # PAP: must have driver + vehicle + assignment sheets.
+    # "Vehical" is a known typo in the Quincy template — treat it as "vehicle".
+    has_driver = any("driver" in s for s in sheets_lower)
+    has_vehicle = any("vehicle" in s or "vehical" in s for s in sheets_lower)
+    has_assignment = any("assignment" in s for s in sheets_lower)
+    if has_driver and has_vehicle and has_assignment:
+        return "PAP"
+
+    # IMS: two or more commercial LOB sheet names present
+    ims_lob_keywords = [
+        "crime", "property", "inland marine", "general liability",
+        "commercial auto", "optional coverage", "netrate",
+    ]
+    ims_sheet_hits = sum(
+        1 for kw in ims_lob_keywords if any(kw in s for s in sheets_lower)
+    )
+    if ims_sheet_hits >= 2:
+        return "IMS"
+
+    # IMS: header-level signals (ds#, test case no)
+    ims_header_signals = ["ds#", "test case no", "netrate"]
+    if any(sig in h for h in all_headers_lower for sig in ims_header_signals):
+        return "IMS"
+
     return "GENERIC"
 
 
@@ -282,14 +346,19 @@ def generate_test_data(
     if effective_row_count == 0:
         return []
 
-    # Build context from previously generated sheets
+    # Build context from previously generated sheets.
+    # To keep the prompt size manageable (and leave room for the LLM to produce
+    # all required output rows), we cap each previous sheet at MAX_PREV_ROWS rows.
+    # This prevents context overflow that causes the LLM to truncate its output.
+    MAX_PREV_ROWS = 6  # enough to show patterns without blowing up the prompt
+
     previous_context = ""
     if previous_sheets_data:
         previous_context = """
 CRITICAL - CROSS-SHEET DATA CONSISTENCY:
-The following sheets have already been generated. You MUST reuse the SAME values for matching/similar fields across sheets.
+The following sheets have already been generated (sample shown). You MUST reuse the SAME values for matching/similar fields across sheets.
 Row-level correspondence is based on Test Case No matching, NOT row position.
-For Driver/Vehicle/Assignment sheets, expand rows according to the row mapping below.
+For Driver/Vehicle/Assignment sheets, expand rows according to the EXACT ROW MAPPING in the rules section.
 
 Fields that MUST stay consistent across sheets include (when the column exists):
 - Test Case No (matching prefix determines the test case)
@@ -301,11 +370,12 @@ Fields that MUST stay consistent across sheets include (when the column exists):
 - Transaction Type must match the Policy sheet for the same Test Case No prefix
 - Rating State and all state-dependent fields
 
-Previously generated data:
+Previously generated data (capped at first few rows per sheet for context):
 """
         for prev_sheet_name, prev_data in previous_sheets_data.items():
-            previous_context += f"\n--- Sheet: '{prev_sheet_name}' ---\n"
-            previous_context += json.dumps(prev_data, indent=2)
+            sample = prev_data[:MAX_PREV_ROWS]
+            previous_context += f"\n--- Sheet: '{prev_sheet_name}' (showing {len(sample)} of {len(prev_data)} rows) ---\n"
+            previous_context += json.dumps(sample, indent=2)
             previous_context += "\n"
 
     user_instruction_block = (special_instruction or "").strip()
