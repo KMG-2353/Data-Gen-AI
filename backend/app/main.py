@@ -132,6 +132,8 @@ async def generate_data(request: dict):
     special_instructions = request.get("special_inst", "")
     lob_selection: list[str] = request.get("lob_selection", [])   # e.g. ["Crime", "General Liability"]
     state_selection: list[str] = request.get("state_selection", [])  # e.g. ["CA", "TX"]
+    driver_count: int | None = request.get("driver_count")   # PAP: user-selected driver count
+    vehicle_count: int | None = request.get("vehicle_count")  # PAP: user-selected vehicle count
 
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")

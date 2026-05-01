@@ -2,6 +2,7 @@ import { useState } from "react";
 import TextareaAutoGrowDemo from "./components/shadcn-studio/textarea/textarea-17.tsx";
 import { Button } from "./components/ui/button.tsx";
 import { Input } from "./components/ui/input";
+import { MultiSelectSearch } from "./components/ui/multi-select-search";
 import {
 	Select,
 	SelectContent,
@@ -23,19 +24,60 @@ const MULTILINE_LOBS = [
 	"Property",
 ];
 const MONOLINE_LOBS = ["GL", "Personal Auto Policy"];
-const US_STATES = [
-	"CA",
-	"TX",
-	"FL",
-	"NY",
-	"PA",
-	"IL",
-	"OH",
-	"GA",
-	"NC",
-	"MI",
-	"ME",
-	"MA",
+
+const AUTO_POLICY_LOBS = ["Personal Auto Policy"];
+
+const US_STATES: { value: string; label: string }[] = [
+	{ value: "AL", label: "Alabama" },
+	{ value: "AK", label: "Alaska" },
+	{ value: "AZ", label: "Arizona" },
+	{ value: "AR", label: "Arkansas" },
+	{ value: "CA", label: "California" },
+	{ value: "CO", label: "Colorado" },
+	{ value: "CT", label: "Connecticut" },
+	{ value: "DE", label: "Delaware" },
+	{ value: "FL", label: "Florida" },
+	{ value: "GA", label: "Georgia" },
+	{ value: "HI", label: "Hawaii" },
+	{ value: "ID", label: "Idaho" },
+	{ value: "IL", label: "Illinois" },
+	{ value: "IN", label: "Indiana" },
+	{ value: "IA", label: "Iowa" },
+	{ value: "KS", label: "Kansas" },
+	{ value: "KY", label: "Kentucky" },
+	{ value: "LA", label: "Louisiana" },
+	{ value: "ME", label: "Maine" },
+	{ value: "MD", label: "Maryland" },
+	{ value: "MA", label: "Massachusetts" },
+	{ value: "MI", label: "Michigan" },
+	{ value: "MN", label: "Minnesota" },
+	{ value: "MS", label: "Mississippi" },
+	{ value: "MO", label: "Missouri" },
+	{ value: "MT", label: "Montana" },
+	{ value: "NE", label: "Nebraska" },
+	{ value: "NV", label: "Nevada" },
+	{ value: "NH", label: "New Hampshire" },
+	{ value: "NJ", label: "New Jersey" },
+	{ value: "NM", label: "New Mexico" },
+	{ value: "NY", label: "New York" },
+	{ value: "NC", label: "North Carolina" },
+	{ value: "ND", label: "North Dakota" },
+	{ value: "OH", label: "Ohio" },
+	{ value: "OK", label: "Oklahoma" },
+	{ value: "OR", label: "Oregon" },
+	{ value: "PA", label: "Pennsylvania" },
+	{ value: "RI", label: "Rhode Island" },
+	{ value: "SC", label: "South Carolina" },
+	{ value: "SD", label: "South Dakota" },
+	{ value: "TN", label: "Tennessee" },
+	{ value: "TX", label: "Texas" },
+	{ value: "UT", label: "Utah" },
+	{ value: "VT", label: "Vermont" },
+	{ value: "VA", label: "Virginia" },
+	{ value: "WA", label: "Washington" },
+	{ value: "WV", label: "West Virginia" },
+	{ value: "WI", label: "Wisconsin" },
+	{ value: "WY", label: "Wyoming" },
 ];
 
 function App() {
@@ -51,7 +93,13 @@ function App() {
 	const [selectedLobs, setSelectedLobs] = useState<string[]>([]);
 	const [selectedStates, setSelectedStates] = useState<string[]>([]);
 	const [testCases, setTestCases] = useState(5);
+	const [vehicleCount, setVehicleCount] = useState(1);
+	const [driverCount, setDriverCount] = useState(1);
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
+
+	const isAutoPolicy = selectedLobs.some((lob) =>
+		AUTO_POLICY_LOBS.includes(lob),
+	);
 
 	const handleFileSelect = async (file: File) => {
 		setIsUploading(true);
@@ -99,6 +147,10 @@ function App() {
 					lob_type: lineOfBusiness,
 					lob_selection: selectedLobs,
 					state_selection: selectedStates,
+					...(isAutoPolicy && {
+						vehicle_count: vehicleCount,
+						driver_count: driverCount,
+					}),
 				}),
 			});
 
@@ -140,11 +192,6 @@ function App() {
 		}
 	};
 
-	const toggleState = (state: string) => {
-		setSelectedStates((prev) =>
-			prev.includes(state) ? prev.filter((s) => s !== state) : [...prev, state],
-		);
-	};
 
 	const lobOptions =
 		lineOfBusiness === "Monoline"
@@ -154,7 +201,7 @@ function App() {
 				: [];
 
 	return (
-		<div className="flex h-screen m-auto w-1/2 max-w-2xl justify-center items-center flex-col gap-5 p-8">
+		<div className="flex min-h-screen m-auto w-full max-w-2xl justify-center items-center flex-col gap-5 px-4 py-8 sm:px-6 md:px-8">
 			<h1 className="text-2xl font-bold">Data Gen Agent</h1>
 			<div className="w-full flex flex-col gap-3">
 				<h2 className="text-sm font-medium">
@@ -211,7 +258,7 @@ function App() {
 						setSelectedLobs([]);
 					}}
 				>
-					<SelectTrigger className="w-full max-w-48">
+					<SelectTrigger className="w-full sm:max-w-48">
 						<SelectValue placeholder="Select LOB Type" />
 					</SelectTrigger>
 					<SelectContent>
@@ -258,26 +305,53 @@ function App() {
 					<p className="text-xs text-gray-500">
 						Select states (optional — defaults to diverse if none selected)
 					</p>
-					<div className="flex flex-wrap gap-2">
-						{US_STATES.map((state) => {
-							const active = selectedStates.includes(state);
-							return (
-								<button
-									key={state}
-									type="button"
-									onClick={() => toggleState(state)}
-									className={`px-3 py-1 rounded-full text-xs border transition-colors ${
-										active
-											? "bg-gray-800 text-white border-gray-800"
-											: "bg-white text-gray-700 border-gray-300 hover:border-gray-500"
-									}`}
-								>
-									{state}
-								</button>
-							);
-						})}
-					</div>
+					<MultiSelectSearch
+						options={US_STATES}
+						selected={selectedStates}
+						onChange={setSelectedStates}
+						placeholder="Select states..."
+						searchPlaceholder="Search by abbreviation or name..."
+					/>
 				</div>
+
+				{/* Vehicle & Driver count — only for auto policies */}
+				{isAutoPolicy && (
+					<div className="w-full flex flex-col gap-3 rounded-lg border border-input p-4">
+						<p className="text-sm font-medium">
+							Auto Policy Configuration
+						</p>
+						<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+							<div className="flex flex-col gap-1.5">
+								<label className="text-xs text-gray-500">
+									Number of Vehicles
+								</label>
+								<Input
+									type="number"
+									value={vehicleCount}
+									onChange={(e) =>
+										setVehicleCount(Math.max(1, Number(e.target.value)))
+									}
+									min={1}
+									max={50}
+								/>
+							</div>
+							<div className="flex flex-col gap-1.5">
+								<label className="text-xs text-gray-500">
+									Number of Drivers
+								</label>
+								<Input
+									type="number"
+									value={driverCount}
+									onChange={(e) =>
+										setDriverCount(Math.max(1, Number(e.target.value)))
+									}
+									min={1}
+									max={50}
+								/>
+							</div>
+						</div>
+					</div>
+				)}
 
 				<TextareaAutoGrowDemo
 					value={sepcialinstruction}

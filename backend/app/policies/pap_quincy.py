@@ -17,37 +17,45 @@ from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# Valid driver/vehicle combinations — hardcoded constraint.
-# The user's rule book allows ONLY these six combinations. Any other
-# combination in Test Case Details is clamped to "1 Driver & 1 Vehicle".
+# Default driver/vehicle combinations — used when the user doesn't select one.
+# Any user-specified (d, v) combination is accepted; these are the defaults
+# for random selection.
 # ---------------------------------------------------------------------------
 
-VALID_DRIVER_VEHICLE_COMBINATIONS: set[tuple[int, int]] = {
+DEFAULT_DRIVER_VEHICLE_COMBINATIONS: list[tuple[int, int]] = [
     (1, 1),
     (2, 1),
     (1, 2),
     (2, 2),
     (3, 1),
     (4, 6),
-}
+]
 
-# Number of Principal drivers for each valid combination.
-# Rule: n_principal = number of eligible (PP / Classic) vehicles, up to driver_count.
-# For (2,2) both vehicles are PP/Classic → both drivers are Principal.
-# For (4,6) all six vehicles are eligible → all 4 drivers are Principal.
+# Keep backward compat alias
+VALID_DRIVER_VEHICLE_COMBINATIONS: set[tuple[int, int]] = set(DEFAULT_DRIVER_VEHICLE_COMBINATIONS)
+
+# Number of Principal drivers for known combinations.
+# Rule: n_principal = min(driver_count, number of eligible PP/Classic vehicles).
+# For unknown combos we compute dynamically.
 _N_PRINCIPAL: dict[tuple[int, int], int] = {
     (1, 1): 1,
-    (2, 1): 1,  # only 1 eligible vehicle → 1 Principal, 1 Occasional
-    (1, 2): 1,  # single driver must be Principal
-    (2, 2): 2,  # both vehicles PP/Classic → both Principal
-    (3, 1): 1,  # only 1 eligible vehicle → 1 Principal, 2 Occasional
-    (4, 6): 4,  # 6 eligible vehicles → all 4 drivers Principal
+    (2, 1): 1,
+    (1, 2): 1,
+    (2, 2): 2,
+    (3, 1): 1,
+    (4, 6): 4,
 }
 
 
 def _get_n_principal(driver_count: int, vehicle_count: int) -> int:
     """Return how many of the drivers (from driver 1 onward) should be Principal."""
-    return _N_PRINCIPAL.get((driver_count, vehicle_count), 1)
+    known = _N_PRINCIPAL.get((driver_count, vehicle_count))
+    if known is not None:
+        return known
+    # For unknown combos: at least 1 vehicle is PP/Classic (required), so
+    # n_principal = min(driver_count, vehicle_count) — each PP/Classic vehicle
+    # needs a principal driver.
+    return min(driver_count, max(1, vehicle_count))
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +102,12 @@ def parse_policy_structure(policy_data: list[dict[str, Any]]) -> list[dict[str, 
             "test_case_no": "",
             "test_case_details": "",
             "transaction_type": "",
+            "policy_change": "",
             "driver_change": "",
             "vehicle_change": "",
             "assignment_change": "",
+            "retro_active": "",
+            "retro_option": "",
             "insured_name": "",
             "driver_count": 1,
             "vehicle_count": 1,
@@ -107,7 +118,6 @@ def parse_policy_structure(policy_data: list[dict[str, Any]]) -> list[dict[str, 
         for key, value in row.items():
             kl = key.lower().strip()
             val = str(value).strip() if value else ""
-            # Test Case No — handle variants like bare 'Test Case'
             if (
                 kl in _TC_EXACT
                 or (kl.startswith("test case") and not any(e in kl for e in _TC_EXCL))
@@ -118,12 +128,18 @@ def parse_policy_structure(policy_data: list[dict[str, Any]]) -> list[dict[str, 
                 info["test_case_details"] = val
             elif "transaction type" in kl:
                 info["transaction_type"] = val
+            elif "policy change" in kl:
+                info["policy_change"] = val
             elif "driver change" in kl:
                 info["driver_change"] = val
             elif "vehicle change" in kl:
                 info["vehicle_change"] = val
             elif "assignment change" in kl:
                 info["assignment_change"] = val
+            elif "retro option" in kl:
+                info["retro_option"] = val
+            elif "retro active" in kl or "retro_active" in kl:
+                info["retro_active"] = val
             elif "insured name" in kl:
                 info["insured_name"] = val
 
@@ -131,7 +147,7 @@ def parse_policy_structure(policy_data: list[dict[str, Any]]) -> list[dict[str, 
         if m:
             d = int(m.group(1))
             v = int(m.group(2))
-            if (d, v) in VALID_DRIVER_VEHICLE_COMBINATIONS:
+            if d >= 1 and v >= 1:
                 info["driver_count"] = d
                 info["vehicle_count"] = v
             else:
@@ -174,6 +190,39 @@ def calculate_expanded_row_count(
     return None
 
 
+def _resolve_transaction_value(
+    txn_type: str,
+    change_flag: str,
+    retro_option: str,
+    is_new_business: bool,
+) -> str:
+    """Determine the Transaction field value (Add/Edit/Delete/blank) for a sub-sheet row.
+
+    Rules derived from the scenario data:
+    - New Business → "Add"
+    - Cancellation / Reinstatement → blank (no changes allowed)
+    - Endorsement / Renewal / Add From Cancel → "Edit" if change_flag=Yes, blank otherwise
+    - Retroactive → if Option=1 same as Endorsement, if Option=3/4 blank
+    """
+    txn_lower = txn_type.lower().strip()
+
+    if is_new_business:
+        return "Add"
+
+    if txn_lower in ("cancellation", "flat cancel", "mid term cancel", "reinstatement"):
+        return ""
+
+    if txn_lower == "retroactive":
+        if retro_option.strip() == "1":
+            return "Edit" if change_flag.strip().lower() == "yes" else ""
+        return ""
+
+    # Endorsement, Renewal, Add From Cancel, Issue From Quote
+    if change_flag.strip().lower() == "yes":
+        return "Edit"
+    return ""
+
+
 def build_row_mapping_instructions(
     sheet_type: str,
     policy_structure: list[dict[str, Any]],
@@ -193,13 +242,15 @@ def build_row_mapping_instructions(
             insured = ps["insured_name"]
             is_new_business = "new business" in txn_type.lower()
             n_principal = _get_n_principal(ps["driver_count"], ps["vehicle_count"])
+            change_flag = ps.get("driver_change", "Yes")
+            retro_option = ps.get("retro_option", "")
+            txn = _resolve_transaction_value(txn_type, change_flag, retro_option, is_new_business)
 
             for d in range(1, ps["driver_count"] + 1):
                 row_num += 1
                 expanded_no = f"{base_no}-{d:02d}"
-                txn = "Add" if is_new_business else "Edit"
-                # First n_principal drivers are Principal; rest are Occasional
                 driver_type = "Principal" if d <= n_principal else "Occasional"
+                txn_hint = f', Transaction = "{txn}"' if txn else ', Transaction = "" (blank — no changes allowed)'
                 name_hint = (
                     f', Name = "{insured}" (same as Insured Name), Driver Type = "{driver_type}"'
                     if d == 1 and insured
@@ -207,15 +258,20 @@ def build_row_mapping_instructions(
                 )
                 lines.append(
                     f"  Row {row_num}: Test Case No = \"{expanded_no}\", "
-                    f"Transaction Type = \"{txn_type}\", Transaction = \"{txn}\"{name_hint}"
+                    f"Transaction Type = \"{txn_type}\"{txn_hint}{name_hint}"
                 )
 
+        no_change_note = (
+            "\nIMPORTANT: When Transaction is blank, ALL driver fields must remain IDENTICAL to the "
+            "most recent New Business or Edit row for that driver in the same test case. No changes allowed."
+        )
         return (
             "EXACT ROW MAPPING FOR DRIVER SHEET:\n"
             f"You MUST generate exactly {row_num} rows with these exact Test Case No values and Driver Types:\n"
             + "\n".join(lines)
             + "\n\nDo NOT deviate from this mapping. Each row above is one driver record."
             + "\nIMPORTANT: Driver Type values above are MANDATORY — do not change them."
+            + no_change_note
         )
 
     elif sheet_type == "vehicle":
@@ -224,22 +280,30 @@ def build_row_mapping_instructions(
             base_no = ps["test_case_no"]
             txn_type = ps["transaction_type"]
             is_new_business = "new business" in txn_type.lower()
+            change_flag = ps.get("vehicle_change", "Yes")
+            retro_option = ps.get("retro_option", "")
+            txn = _resolve_transaction_value(txn_type, change_flag, retro_option, is_new_business)
 
             for v in range(1, ps["vehicle_count"] + 1):
                 row_num += 1
                 expanded_no = f"{base_no}-{v:02d}"
-                txn = "Add" if is_new_business else "Edit"
+                txn_hint = f', Transaction = "{txn}"' if txn else ', Transaction = "" (blank — no changes allowed)'
                 lines.append(
                     f"  Row {row_num}: Test Case No = \"{expanded_no}\", "
-                    f"Transaction Type = \"{txn_type}\", Transaction = \"{txn}\""
+                    f"Transaction Type = \"{txn_type}\"{txn_hint}"
                 )
 
+        no_change_note = (
+            "\nIMPORTANT: When Transaction is blank, ALL vehicle fields must remain IDENTICAL to the "
+            "most recent New Business or Edit row for that vehicle in the same test case. No changes allowed."
+        )
         return (
             "EXACT ROW MAPPING FOR VEHICLE SHEET:\n"
             f"You MUST generate exactly {row_num} rows with these exact Test Case No values:\n"
             + "\n".join(lines)
             + "\n\nDo NOT deviate from this mapping. Each row above is one vehicle record."
             + "\nEach vehicle in the same test case MUST have a UNIQUE VIN - no duplicate VINs allowed."
+            + no_change_note
         )
 
     elif sheet_type == "assignment":
@@ -284,14 +348,17 @@ def build_row_mapping_instructions(
             row_num += 1
             lines.append(
                 f"  Row {row_num}: Test Case No = \"{ps['test_case_no']}\", "
-                f"Transactions = \"{ps['transaction_type']}\""
+                f"Transactions = \"{ps['transaction_type']}\", "
+                f"Test Case Details = \"{ps['test_case_details']}\""
             )
         return (
             "EXACT ROW MAPPING FOR SUMMARY SHEET:\n"
             f"You MUST generate exactly {row_num} rows:\n"
             + "\n".join(lines)
             + "\n\nExecute Transaction = \"No\", Hold Transaction = \"No\"."
-            + "\nAll other fields (Wins Reference Quote, Python Reference Quote, etc.) should be BLANK."
+            + "\nAll other fields (Wins Reference Quote, Python Reference Quote, Wins Issued Policy Number, "
+            "Python Issued Policy Number, Wins Premium, Python Premium, Status, "
+            "Wins Screenshot Link, Python Screenshot Link): ALWAYS BLANK."
         )
 
     elif sheet_type == "questions_remarks":
@@ -319,6 +386,7 @@ def build_row_mapping_instructions(
             has_infraction = False
             test_case_no = ""
             txn_type = ""
+            txn_value = ""
             for key, val in drv.items():
                 kl = key.lower().strip()
                 if "add infraction" in kl and str(val).strip().lower() == "yes":
@@ -331,13 +399,17 @@ def build_row_mapping_instructions(
                         test_case_no = str(val).strip() if val else ""
                 if "transaction type" in kl:
                     txn_type = str(val).strip() if val else ""
+                if kl == "transaction":
+                    txn_value = str(val).strip() if val else ""
 
             row_num += 1
             is_new_business = "new business" in txn_type.lower()
-            txn = "Add" if is_new_business else "Edit"
+            txn_lower = txn_type.lower().strip()
+            is_no_change = txn_lower in ("cancellation", "flat cancel", "mid term cancel", "reinstatement")
+            txn = "Add" if is_new_business else (txn_value if txn_value else ("" if is_no_change else "Edit"))
             infraction_note = (
                 "FILL infraction fields (Infraction Type, Violation Date, SDIP Points, etc.)"
-                if has_infraction
+                if has_infraction and not is_no_change
                 else "Leave ALL infraction fields BLANK (no infraction for this driver)"
             )
             lines.append(
@@ -365,18 +437,23 @@ def build_row_mapping_instructions(
 PAP_CORE_RULES = """
 PERSONAL AUTO POLICY (PAP) – CORE RULES (always enforced):
 - Policy structure: every test case starts with exactly one "New Business" transaction.
-- Test Case Details MUST be one of exactly 6 valid combinations:
-    "1 Driver & 1 Vehicle", "2 Driver & 1 Vehicle", "1 Driver & 2 Vehicle",
-    "2 Driver & 2 Vehicle", "3 Driver & 1 Vehicle", "4 Driver & 6 Vehicle"
+  Subsequent transactions (Endorsement, Cancellation, Reinstatement, Retroactive, Renewal, Add From Cancel)
+  follow in sequence within the same test case. Each subsequent transaction carries forward all data
+  from the previous transaction unless a Change flag (Policy/Driver/Vehicle/Assignment Change) is Yes.
+- Test Case Details format: "X Driver & Y Vehicle" — defines exact driver and vehicle counts.
 - Driver count and vehicle count defined by Test Case Details must be reproduced EXACTLY across all sheets.
 - At least one vehicle per test case must be "Private Passenger" or "Classic-Refer to CO (Stated Amount)".
 - Date format for ALL date fields: MMDDYYYY (8 digits, NO slashes, NO dashes, NO separators of any kind).
 - Effective Date: within ±60 days of today for non-Renewal transactions.
   For Renewal: 300+ days in the past.
-- Expiration Date: exactly one year after Effective Date (same month/day, next year).
+  CRITICAL: All transactions within the same test case share the SAME effective date (except Renewal).
 - Transaction Type value in Driver, Vehicle, and Assignment sheets must match the Policy sheet exactly.
 - No blank Test Case No fields — every row in every sheet must have a valid Test Case No.
 - Assignment sheet: each driver gets one row; ordinals fill only eligible-vehicle columns (no gaps).
+- SUBSEQUENT TRANSACTION DATA CARRY-FORWARD RULE:
+  When Transaction is blank (Cancellation, Reinstatement, or Change=No rows),
+  ALL fields must be IDENTICAL to the most recent New Business or Edit row in the same test case.
+  The LLM must copy forward values exactly — no random generation for carried-forward rows.
 """
 
 POLICY_SHEET_RULES = """
@@ -385,8 +462,7 @@ POLICY SHEET RULES:
 - Transaction Types (must follow this sequence logic):
     New Business = first transaction for every test case
     Endorsement = after New Business
-    Flat Cancel = cancellation date equals effective date of New Business
-    Mid Term Cancel = cancellation done after the effective date
+    Cancellation = after New Business (Flat Cancel if date=effective date, Mid Term Cancel if after)
     Add From Cancel = only after Flat Cancel, same date as cancellation
     Reinstatement = only after Mid Term Cancel, same date as cancellation
     Retroactive = at least two endorsements must have been completed after New Business
@@ -395,57 +471,94 @@ POLICY SHEET RULES:
 - Driver Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any driver field changed, No otherwise. Always No for Cancellation/Reinstatement.
 - Vehicle Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any vehicle field changed, No otherwise. Always No for Cancellation/Reinstatement.
 - Assignment Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any assignment field changed, No otherwise. Always No for Cancellation/Reinstatement.
-- Test Case Details: ONLY these 6 combinations are valid:
-    "1 Driver & 1 Vehicle", "2 Driver & 1 Vehicle", "1 Driver & 2 Vehicle",
-    "2 Driver & 2 Vehicle", "3 Driver & 1 Vehicle", "4 Driver & 6 Vehicle"
-  This field is the single source of truth for driver and vehicle counts across ALL sheets.
+- Test Case Details: This field is the single source of truth for driver and vehicle counts across ALL sheets.
+  Format: "X Driver & Y Vehicle" where X = number of drivers, Y = number of vehicles.
 - Effective Date: MMDDYYYY format (8 digits, NO slashes, NO dashes). Current date ±60 days.
   CRITICAL: All transactions within the same test case (TS-XX) must have the SAME effective date.
   Exception: Renewal transaction gets its own effective date (300+ days in the past).
+  Effective date for any test case with Renewal must be 300 days in the past.
 - Endorsement Date: MMDDYYYY format (NO slashes).
   For New Business: Endorsement Date = Effective Date (must be identical).
-  For other transactions: >= New Business date and < 50 days in future.
-  For Cancellation: > New Business date. For Reinstatement: same as Cancellation date.
-  For Retroactive: same as the previous Endorsement date.
+  For Endorsement: >= New Business date and < 50 days in future.
+  For Cancellation: > New Business date.
+  For Reinstatement: same as Cancellation date.
+  For Retroactive: same as the PREVIOUS Endorsement date.
+  For Add From Cancel: same as Cancellation date.
+- Retro active / Retro Option: only mandatory for Retroactive transactions.
+  Endorse and option = 1 (same as Endorsement), Final Cancel and option = 3 (same as Cancellation),
+  Reinstate and option = 4 (same as Reinstatement).
 - Rating state = ME (default unless overridden):
-    Company Code = 0020, Agent = 05899 or 05297, Loss Free = 1-9 (any number)
+    Company Code = 0020, Agent = 05899 or 05297 or 05899, Loss Free = 1-9 (any number)
     Type, UMPD, CT PIP-BRB = Blank (these are CT-only fields)
 - Rating state = RI: Company Code = 0010, Agent = 00130
 - Rating state = CT: Company Code = 0010, Agent = 00130
+- Insured Name: Random US name for New Business. NO CHANGE for all subsequent transactions.
+- Phone Type: Cell, Home, or Work
 - Phone: 10 digits, format "1111111111" (no dashes, no spaces, no parentheses)
 - Email: ends with @test.com or @gmail.com
-- Liability CSL and Liability BI are MUTUALLY EXCLUSIVE — select one or the other, never both.
-  CSL options: 125,000 / 200,000 / 300,000 / 500,000 / 1,000,000
-  BI options: 50/100 / 100/300 / 250/500 / 500/1,000
-- UM/UIM CSL: value must be <= Liability CSL. Select from: 100,000 / 125,000 / 200,000 / 300,000 / 500,000 / 1,000,000
-- UM/UIM BI: value must be <= Liability BI. Only if Liability BI selected.
-- PD (25,000 / 50,000 / 100,000 / 250,000): only fill if Liability BI is selected.
-- Med Pay: 2,000 / 5,000 / 10,000 / 25,000 / 50,000
-- Payment Plan: one value for the entire test case.
+
+TRANSACTION RULES FOR POLICY FIELDS:
+Each field below lists what is allowed per transaction type.
+"No change" = value MUST remain identical to the previous transaction in the same test case.
+
+Liability CSL (125,000 / 200,000 / 300,000 / 500,000 / 1,000,000):
+  Mutually exclusive with Liability BI — cannot select both.
+  New Business: select one value. Endorsement: change only if Policy Change=Yes.
+  Cancellation/Reinstatement: no change. Add From Cancel: change if Policy Change=Yes.
+  Retroactive: if Option=1 same as Endorsement, else no change. Renewal: change if Policy Change=Yes.
+
+UM/UIM CSL (100,000 / 125,000 / 200,000 / 300,000 / 500,000 / 1,000,000):
+  Must be <= Liability CSL. Same transaction rules as Liability CSL.
+
+Med Pay (2,000 / 5,000 / 10,000 / 25,000 / 50,000):
+  Same transaction rules as Liability CSL.
+
+Liability BI (50/100 / 100/300 / 250/500 / 500/1,000):
+  Mutually exclusive with Liability CSL. Same transaction rules.
+
+UM/UIM BI (20/40 / 25/50 / 50/100 / 100/200 / 100/300 / 250/500 / 500/1,000):
+  Must be <= Liability BI. Only if Liability BI selected. Same transaction rules.
+
+PD (25,000 / 50,000 / 100,000 / 250,000):
+  Only if Liability BI is selected. Same transaction rules.
+
+Type (Standard/Conversion): CT only. Same transaction rules.
+UMPD (25,000 / 50,000): CT and RI only. Blank for ME.
+CT PIP-BRB (Yes/blank): CT only. Blank if Med Pay selected.
+
+Payment Plan: one value for entire test case.
   Options: "Direct Bill - 2 Pay", "Direct Bill - 4 Pay", "Direct Bill - 9 Pay",
   "EFT - 10 Pay Pick a Day", "Direct Bill - One Pay 5% Discount", "EFT - 12 Month Installment Plan"
-- Monthly Due Day: fill ONLY if Payment Plan = "EFT - 10 Pay Pick a Day". Value: 1-30.
-- WINS Quote Number, Python Quote Number, Wins Policy Number, Python Policy Number,
-  Insurance Score, Client ID, EFT: always Blank.
+  Endorsement: change if Policy Change=Yes. Cancellation/Reinstatement: no change.
+
+Monthly Due Day: fill ONLY if Payment Plan = "EFT - 10 Pay Pick a Day". Value: 1-30.
+
+- WINS Quote Number, Python Quote Number, Wins Policy Number, Python Policy Number: always Blank.
+- Insurance Score, Client ID, EFT: always Blank.
 - Less than 3 years at current address = Yes: fill Previous Street/City/State/ZIP. No = leave blank.
-- Retroactive options: Endorse=option 1, Final Cancel=option 3, Reinstate=option 4
-- Type (Standard/Conversion): CT state only. Blank for ME and RI.
-- UMPD (25,000 / 50,000): CT and RI states only. Blank for ME.
-- CT PIP-BRB (Yes/blank): CT state only. No (blank) if Med Pay is selected.
+- Umbrella Endorsement Written with Quincy: Yes or blank.
+- Account: Yes or blank. If blank, Policy# and Policy No must also be blank.
+- Credit Company: RI only. Quincy Mutual GRP (fill Policy#/No), Narragansett/Andover (no fill).
+- Policy# options for CT/RI: Quincy='HP', NEMIC='HW', Andover='HP', Quincy Grp=TBD.
+  For ME: AUT / DWL / HOM / SON / PIM.
+- Policy No: 806993 or 806995 (fill only if Policy# is selected, blank if Account is blank)
+- Loss Free: ME state only, value 1-9.
 - Group (Yes/blank), Corporate Car (Yes/blank): any state.
-- Credit Company: RI state only. Options: Quincy Mutual GRP / Narragansett / Andover.
-  If Quincy Mutual GRP: fill Policy# and Policy No. If Narragansett/Andover: leave blank.
-- Account (Yes/blank): if blank, Policy# and Policy No must also be blank.
-- Policy# options for ME: AUT / DWL / HOM / SON / PIM
-- Policy No: 806993 or 806995 (fill only if Policy# is selected)
-- Loss Free: ME state only, value 1-9
-- Producer Name: CT state only — NANCY MENDIZABAL or MICHAEL PRENDERGAST
+- Producer Name: CT state only — NANCY MENDIZABAL or MICHAEL PRENDERGAST. Blank for ME/RI.
 """
 
 DRIVER_SHEET_RULES = """
 DRIVER SHEET RULES:
 - Test Case No format: TS-XX-XX-XX (last XX = driver number: 01, 02, 03 ...)
-- Transaction: "Add" for New Business. "Edit" for Endorsement/Renewal/Retroactive/Add From Cancel. "Delete" only if driver count > 1.
+- Transaction values:
+    New Business: "Add" only (create drivers as per Test Case Details)
+    Endorsement: "Add"/"Edit"/"Delete" ONLY if Driver Change=Yes; blank if Driver Change=No
+    Cancellation: NO Transaction allowed (blank). All fields carry forward unchanged.
+    Reinstatement: NO Transaction allowed (blank). All fields carry forward unchanged.
+    Add From Cancel: "Add"/"Edit"/"Delete" allowed
+    Retroactive: if Option=1 then "Add"/"Edit"/"Delete" allowed; if Option=3/4 then blank (no change)
+    Renewal: "Add"/"Edit"/"Delete" allowed if Driver Change=Yes
+    "Delete" is only allowed if driver count > 1 in the test case.
 - First driver's Name MUST equal Insured Name from Policy sheet. Second driver onward = random two-word name.
 - Date of Birth: MMDDYYYY format (NO slashes). Year range: 1930 to (current year - 16), i.e. 1930–2008.
 - Age: calculated from Date of Birth to today.
@@ -460,72 +573,105 @@ DRIVER SHEET RULES:
       "3 Driver & 1 Vehicle" → 1 Principal, 2 Occasional
       "4 Driver & 6 Vehicle" → 4 Principal (all 4 drivers are Principal)
     Occasional driver type: valid only when there are multiple drivers and vehicles.
-    "Occasional" is NOT valid when all vehicles are eligible and drivers ≤ eligible vehicles.
-- Marital Status: Single / Married / Divorced / Widowed.
-- Relationship To Insured: first driver = "Insured". Others = Father/Mother/Spouse/Sibling/Son/Daughter/Other.
+
+TRANSACTION RULES FOR DRIVER FIELDS:
+"No change" = value MUST remain identical to the most recent New Business or Edit row for that driver.
+
+Marital Status (Single/Married/Divorced/Widowed):
+  New Business: any value. Endorsement: change only if Driver Change=Yes.
+  Cancellation/Reinstatement: no change. Add From Cancel: change if Driver Change=Yes.
+  Retroactive Option 1: same as Endorsement. Option 3/4: no change. Renewal: change if Driver Change=Yes.
+
+Relationship To Insured: first driver = "Insured". Same transaction rules as Marital Status.
+
+Occupation: Same transaction rules as Marital Status.
+
+Driver Training (Yes/blank, only if age <= 20):
+  Same transaction rules. If set to Yes, Driver Training Completion Date = License Date.
+
+Mature Credit (Yes/blank):
+  Same transaction rules. If set to Yes, Mature Credit Completion Date = License Date.
+
+Good Student (Yes/blank, only if age <= 25):
+  Same transaction rules.
+
+Operator student 100+ miles (Yes/blank, only if age <= 20):
+  Same transaction rules.
+
+Add Infraction (Yes/blank):
+  New Business: Yes or blank. Endorsement: change only if Driver Change=Yes.
+  Cancellation/Reinstatement: no change. Add From Cancel: change if Driver Change=Yes.
+  Retroactive Option 1: same as Endorsement. Renewal: change if Driver Change=Yes.
+
 - License Date: Date of Birth + 18 years, MMDDYYYY format (NO slashes).
 - Lic State: CT, RI, or ME. Preferably same as Rating State.
-- License #: CT state = exactly 9 digits. ME state = exactly 7 digits. RI state = 7 to 9 digits.
-- Occupation: CONSTRUCTION AND EXTRACTION / HEALTHCARE SUPPORT / STUDENT / MANAGEMENT /
-  RETIRED / LEGAL / UNEMPLOYED (pick any one).
-- Driver Training: Yes or Blank. Yes ONLY if driver age <= 20.
-  If Yes: Driver Training Completion Date = License Date.
-- Mature Credit: Yes or Blank. If Yes: Mature Credit Completion Date = License Date.
-- Good Student: Yes or Blank. Yes ONLY if driver age <= 25.
-- Operator student 100+ miles from home: Yes or Blank. Yes ONLY if driver age <= 20.
-- MVR Re-Order: always NO.
-- Claims Report Re-Order: always NO.
-- Violations in last 3 years: always Blank.
-- Accidents/Claims in last 3 years: always Blank.
-- Add Infraction: Yes or Blank. If Yes, Infraction sheet must have a record for this driver.
+- License #: CT = 9 digits, ME = 7 digits, RI = 7-9 digits.
+- MVR Re-Order: always NO. Claims Report Re-Order: always NO.
+- Violations in last 3 years: always Blank. Accidents/Claims in last 3 years: always Blank.
 - Remove Infraction: Yes or Blank. If Yes, Remove Infraction SDIP is mandatory.
-  Only possible if an infraction was previously added for this driver.
 """
 
 VEHICLE_SHEET_RULES = """
 VEHICLE SHEET RULES:
 - Test Case No format: TS-XX-XX-XX (last XX = vehicle number: 01, 02, 03 ...)
-- Transaction: "Add" for New Business. "Edit" for Endorsement/Renewal/Retroactive/Add From Cancel. "Delete" only if vehicle count > 1.
+- Transaction values:
+    New Business: "Add" only (create vehicles as per Test Case Details)
+    Endorsement: "Add"/"Edit"/"Delete" ONLY if Vehicle Change=Yes; blank if Vehicle Change=No
+    Cancellation: NO Transaction allowed (blank). All fields carry forward unchanged.
+    Reinstatement: NO Transaction allowed (blank). All fields carry forward unchanged.
+    Add From Cancel: "Add"/"Edit"/"Delete" allowed
+    Retroactive: if Option=1 then "Add"/"Edit"/"Delete" allowed; if Option=3/4 then blank (no change)
+    Renewal: "Add"/"Edit"/"Delete" allowed if Vehicle Change=Yes
+    "Delete" is only allowed if vehicle count > 1 in the test case.
 - Territory: always Blank.
-- Mature Driver#: always Blank.
-- Mature Driver: always Blank.
-- Garaging Street: realistic street address (street only, no city/state/ZIP).
-- City, State, Zipcode: consistent real location; State must be the same as Rating State (ME, RI, or CT).
-- STS: always Blank.
+- Mature Driver#: always Blank. Mature Driver: always Blank.
+- Garaging Street, City, State, Zipcode: realistic address; State = Rating State (ME, RI, or CT).
 - Vehicle Types: Antique-Refer to CO (Stated Amount), Classic-Refer to CO (Stated Amount),
   Motorhome (Cost New), Private Passenger, Recreational Trailer (Cost New), Utility Trailer (Stated Amt).
   If only 1 vehicle: MUST be Private Passenger or Classic-Refer to CO (Stated Amount).
   If multiple vehicles: at least one MUST be Private Passenger or Classic.
-- Veh Use: Pleasure / Business / Commute / Farming.
-  Motorhome, Utility Trailer, Antique → Pleasure ONLY.
-  If Commute: Miles One-way field is mandatory (01 to 02 / 03 to 14 / 15+).
-- VIN, Model Year, Make/Model, Style: use EXACT rows from VIN table provided. NO duplicates within same test case.
-- Vehicle Make column: always Blank.
-- Make/Model: copy exactly as shown in the VIN table. Do NOT split the data.
-- Pass/Rest: "00% No Passive Restraint" / "20% Seat Belt - Driver only" / "20% Air Bag - Driver only" /
-  "30% Seat Belts- Both Sides" / "30% Air Bags - Both Sides" / "30% Not classified Both Sides"
-- Anti-Theft: "00% No Anti-Theft Credit" / "05% Alarm Only" / "05% Active Disabling Device" /
-  "15% Passive Disabling Device" / "All Other"
+
+TRANSACTION RULES FOR VEHICLE FIELDS:
+"No change" = value MUST remain identical to the most recent New Business or Edit row for that vehicle.
+
+Veh Use (Pleasure/Business/Commute/Farming):
+  Motorhome/Utility Trailer/Antique → Pleasure ONLY.
+  If Commute: Miles One-way is mandatory. New Business: any valid value.
+  Endorsement: change only if Vehicle Change=Yes. Cancellation/Reinstatement: no change.
+  Add From Cancel: can change. Retroactive: depends on option. Renewal: can change.
+
+Miles One-way (01 to 02 / 03 to 14 / 15+ / blank):
+  Populate only if Veh Use=Commute. Endorsement: change if Vehicle Change=Yes. Others: no change.
+
+Annual Miles (optional, 99-99,999):
+  Endorsement: change if Vehicle Change=Yes. Others: no change.
+
+Comp Ded (blank/50/100/200/250/500/1,000 — use 50 rarely):
+  Endorsement: change if Vehicle Change=Yes. Cancellation/Reinstatement: no change.
+  Add From Cancel/Retroactive Option 1/Renewal: can change.
+
+Full Glass: Yes ONLY if Private Passenger AND Comp Ded >= 200. Else blank. Same transaction rules.
+Coll Ded (blank/50/100/200/250/500/1,000 — use 50 rarely): Same transaction rules as Comp Ded.
+Sub Trans (30/900 / 40/1,000 / 50/1,500 / blank): only if Comp Ded >= 200. Same transaction rules.
+Towing (25/50/75/100/blank): only if Comp Ded >= 200. Same transaction rules.
+Excess Electronic (1,500-5,000/blank): only if Comp Ded >= 200. Same transaction rules.
+Corporate Car Discount: Yes only if Comp Ded >= 100, else blank. Same transaction rules.
+Joint Ownership: Yes only if Comp Ded >= 100, else blank. Same transaction rules.
+Enhancement Endorsement: Yes only if Coll Ded >= 200, else blank. Cannot be Yes with Trip Interrupt 600.
+Delete Liability: Yes or blank. Same transaction rules.
+Trip Interrupt 600: Yes only if Comp Ded >= 200, else blank. Cannot be Yes with Enhancement Endorsement.
+Suspend Liability: must equal Delete Liability (both Yes or both blank). Same transaction rules.
+
+- VIN, Model Year, Make/Model, Style: use EXACT rows from VIN table. NO duplicates within test case.
+- Vehicle Make: always Blank. Make/Model: copy exactly from VIN table.
+- Pass/Rest, Anti-Theft: select from provided options.
 - Anti-Lock: always Yes.
-- Comp Ded: blank / 50 / 100 / 200 / 250 / 500 / 1,000 (use 50 very rarely).
-- Full Glass: Yes ONLY if vehicle type is Private Passenger AND Comp Ded >= 200. Otherwise blank.
-- Coll Ded: blank / 50 / 100 / 200 / 250 / 500 / 1,000 (use 50 very rarely).
-- Sub Trans (30/900, 40/1,000, 50/1,500 or blank): only if Comp Ded >= 200.
-- Towing (25, 50, 75, 100 or blank): only if Comp Ded >= 200.
-- Excess Electronic (1,500–5,000): only if Comp Ded >= 200.
-- Corporate Car Discount: Yes only if Comp Ded >= 100, else blank.
 - Loan/Lease Coverage: always blank.
 - RI UMPD: blank for CT and ME states.
-- Joint Ownership: Yes only if Comp Ded >= 100, else blank.
-- Enhancement Endorsement: Yes only if Coll Ded >= 200, else blank.
-  Enhancement Endorsement and Trip Interrupt 600 CANNOT both be Yes — only one at a time.
-- Delete Liability: Yes or blank.
-- Trip Interrupt 600: Yes only if Comp Ded >= 200, else blank.
-  Enhancement Endorsement and Trip Interrupt 600 CANNOT both be Yes — only one at a time.
-- Cost New: random 1,000–100,000 (no $ symbol). ONLY for: Private Passenger, Motorhome, Recreational Trailer.
-- Stated Amt: random 1,000–100,000 (no $ symbol). ONLY for: Classic, Antique, Utility Trailer.
-- Customized Amt: thousands format only (2,000 / 5,000 / 10,000 / 20,000 / 35,000 / 45,000 / 60,000). No $ symbol.
-- Suspend Liability: must equal Delete Liability (both Yes or both blank).
+- Cost New: 1,000-100,000 (no $). ONLY for: Private Passenger, Motorhome, Recreational Trailer.
+  Endorsement: change if Vehicle Change=Yes. Cancellation/Reinstatement: no change.
+- Stated Amt: 1,000-100,000 (no $). ONLY for: Classic, Antique, Utility Trailer. Same transaction rules.
+- Customized Amt: thousands format (2,000/5,000/10,000/20,000/35,000/45,000/60,000). Same transaction rules.
 """
 
 ASSIGNMENT_SHEET_RULES = """
@@ -533,24 +679,27 @@ ASSIGNMENT SHEET RULES:
 - Test Case No format: TS-XX-XX-XX (last XX = driver number, matches Driver sheet)
 - Name: must match exactly the driver's Name from Driver sheet.
 - Driver Type: must match exactly the driver's Driver Type from Driver sheet.
+
+TRANSACTION RULES FOR ASSIGNMENT:
+  New Business: create assignment as per Driver & Vehicle count.
+  Endorsement: change ONLY if Assignment Change=Yes (e.g., driver/vehicle added/removed requires remapping).
+  Cancellation: NO change allowed. Carry forward from previous transaction.
+  Reinstatement: NO change allowed. Carry forward from previous transaction.
+  Add From Cancel: assignment can be updated.
+  Retroactive: if Option=1 then can change, else no change.
+  Renewal: change if Assignment Change=Yes.
+
 - Only vehicles of type "Private Passenger" or "Classic-Refer to CO (Stated Amount)" get assignment columns.
   All other types (Motorhome, Recreational Trailer, Utility Trailer, Antique, etc.) are SKIPPED — their
   Veh# column must be blank; no ordinal value should appear in that column.
 - N = count of ELIGIBLE (Private Passenger or Classic) vehicles in the transaction group.
-- Each driver row covers exactly the columns for eligible vehicles only; ineligible vehicle columns are blank.
-- NO gaps: ordinals fill Veh# columns for eligible vehicles consecutively (Veh#1, Veh#2, etc. for the
-  columns that correspond to eligible vehicles); columns for ineligible vehicles stay blank.
 - Assignment uses backward circular rotation:
     ordinal for eligible-driver i, eligible-vehicle j = (j - i) % N + 1 → "1st", "2nd", "3rd", …
+  Example (1 driver, 1 vehicle): Driver 1: Veh#1=1st
+  Example (2 drivers, 1 vehicle): Driver 1: Veh#1=1st, Driver 2: Veh#1=2nd
   Example (2 drivers, 2 eligible vehicles):
     Driver 1: Veh#1=1st, Veh#2=2nd
     Driver 2: Veh#1=2nd, Veh#2=1st
-  Example (4 drivers, 6 vehicles):
-    Driver 1: 1st  2nd  3rd  4th  5th  6th
-    Driver 2: 6th  1st  2nd  3rd  4th  5th
-    Driver 3: 5th  6th  1st  2nd  3rd  4th
-    Driver 4: 4th  5th  6th  1st  2nd  3rd
-- Eligible drivers (Principal or Occasional) get ordinals. Ineligible driver types get blank cells.
 - The EXACT row mapping below pre-computes all ordinals — follow it exactly.
 """
 
@@ -558,17 +707,29 @@ INFRACTION_SHEET_RULES = """
 INFRACTION SHEET RULES:
 - Generate one row for EVERY driver (all test case numbers must appear), not just those with infractions.
 - Test Case No: same as the driver's Test Case No from Driver sheet (TS-XX-XX-XX).
+
+TRANSACTION RULES FOR INFRACTION:
+  New Business: "Add" allowed only if Driver sheet "Add Infraction" = Yes for that driver.
+  Endorsement: "Add"/"Edit"/"Delete" ONLY if Driver Change=Yes; no change if Driver Change=No.
+  Cancellation: NO change allowed. Leave infraction fields unchanged.
+  Reinstatement: NO change allowed.
+  Add From Cancel: "Add"/"Edit"/"Delete" allowed if Driver Change=Yes.
+  Retroactive: if Option=1 same as Endorsement; if Option=3/4 no change.
+  Renewal: "Add"/"Edit"/"Delete" allowed if Driver Change=Yes.
+
 - For drivers where Add Infraction = Yes in Driver sheet: fill all infraction fields.
-- For drivers where Add Infraction = blank/No: row exists but ALL infraction fields are BLANK
-  (Infraction Type, Violation Date, SDIP Points, Infraction Description, Violation Code, At Fault Accident,
-   Accident City, Accident State, Claim Number, Claim Type, all Amount fields = blank).
-- Infraction Type (only for Add Infraction = Yes): "Accident/Loss" or "Moving Violation"
-- Violation/Accident Date: MMDDYY format (6 digits, no slashes), within last 3 years
-- SDIP Points: 1-99. If multiple infractions, sum must equal 99.
-- Infraction Description and Violation Code: use exact pairs from the provided table
+- For drivers where Add Infraction = blank/No: row exists but ALL infraction fields are BLANK.
+- Infraction Type: "Accident/Loss" or "Moving Violation"
+- Violation/Accident Date: MMDDYY format (6 digits, no slashes), within last 3 years, not future.
+- SDIP Points: 1-99. If multiple infractions for one driver, sum should equal 99.
+- Infraction Description and Violation Code: use exact pairs from the provided table.
 - At Fault Accident: Yes or blank. If Comprehensive claim type: must be blank.
-- Accident City/State/Claim Number/Claim Type/Amount fields: only if Infraction Type = "Accident/Loss"
-- If Claim Type = "No Payment": all Amount fields must be blank.
+- Accident City/State/Claim Number/Claim Type/Amount fields: only if Infraction Type = "Accident/Loss".
+- Claim Number: G4678967 / BO983746 / 4SA06230894 / A000D222
+- Claim Type: Glass Only / Towing Only / No Payment / Uninsured / Comprehensive
+- If Claim Type = "No Payment": ALL Amount fields must be blank.
+- Amount fields: Bl Amount of Loss, PD Amount of Loss, Medical Amount of Loss,
+  PIP Amount of Loss, Collision Amount of Loss, Other Amount of Loss — random up to 200,000.
 """
 
 SUMMARY_SHEET_RULES = """
