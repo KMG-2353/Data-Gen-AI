@@ -7,7 +7,6 @@ import re
 from datetime import date
 from typing import Any
 
-
 def _clean_response_text(text: str) -> str:
     """Normalize common fenced-code formatting around model output."""
     cleaned = text.strip()
@@ -242,7 +241,16 @@ def _enforce_effective_expiration_date_range(
 
 
 def configure_openai() -> OpenAI:
-    """Configure OpenAI client with API key from environment."""
+    """Configure LLM client, routing to Google or OpenAI based on MODEL_PROVIDER env."""
+    provider = os.getenv("MODEL_PROVIDER", "openai").lower()
+    if provider == "gemini":
+        key = os.getenv("GOOGLE_API_KEY")
+        if not key:
+            raise ValueError("GOOGLE_API_KEY not found (required when MODEL_PROVIDER=gemini)")
+        return OpenAI(
+            api_key=key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise ValueError("OPENAI_API_KEY not found")
@@ -338,7 +346,8 @@ def generate_test_data(
     """Generate test data using OpenAI for US insurance domain."""
 
     client = configure_openai()
-    model_name = os.getenv("OPENAI_MODEL", "")
+    provider = os.getenv("MODEL_PROVIDER", "openai").lower()
+    model_name = os.getenv("GEMINI_MODEL" if provider == "gemini" else "OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o"))
 
     effective_row_count = row_count_override if row_count_override is not None else row_count
 

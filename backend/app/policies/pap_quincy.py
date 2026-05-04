@@ -86,6 +86,143 @@ def detect_sheet_type(sheet_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# State-selection enforcement (deterministic post-processing for PAP)
+# ---------------------------------------------------------------------------
+
+_STATE_COMPANY: dict[str, str] = {"ME": "0020", "CT": "0010", "RI": "0010"}
+_STATE_AGENTS: dict[str, list[str]] = {
+    "ME": ["05899", "05297"],
+    "CT": ["00130"],
+    "RI": ["00130"],
+}
+_ME_VALID_POLICY_PREFIXES = {"AUT", "DWL", "HOM", "SON", "PIM"}
+_CT_RI_DEFAULT_POLICY_PREFIX = "HP"
+
+
+def _tc_group(tc_no: str) -> str:
+    """Extract group prefix from a test case number, e.g. 'TS-01-02-01' → 'TS-01'."""
+    parts = str(tc_no or "").split("-")
+    return "-".join(parts[:2]) if len(parts) >= 2 else tc_no
+
+
+def _get_tc_no_from_row(row: dict[str, Any]) -> str:
+    """Extract Test Case No value from a row dict regardless of header name."""
+    _TC_EXACT = {"test case no", "test case #", "test case number", "test case"}
+    _TC_EXCL = ("detail", "description", "type", "status", "note")
+    for key, val in row.items():
+        kl = key.lower().strip()
+        if kl in _TC_EXACT or (kl.startswith("test case") and not any(e in kl for e in _TC_EXCL)):
+            return str(val).strip() if val else ""
+    return ""
+
+
+def enforce_pap_state_selection(
+    rows: list[dict[str, Any]],
+    sheet_name: str,
+    state_selection: list[str],
+    policy_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically enforce user-selected states across PAP sheets.
+
+    Policy sheet: assigns states to test case groups by cycling through
+    state_selection, then updates Rating state, Company Code, Agent, and
+    fixes any forbidden Policy# values.
+
+    Driver sheet: updates Lic State to match the test case's rating state.
+    Vehicle sheet: updates garaging State to match the test case's rating state.
+    """
+    if not state_selection or not rows:
+        return rows
+
+    sheet_type = detect_sheet_type(sheet_name)
+
+    # Build group→state map from policy_rows (used by driver/vehicle sheets)
+    group_to_state: dict[str, str] = {}
+
+    if sheet_type == "policy":
+        # Determine test case group order from rows (preserving first-seen order)
+        group_order: list[str] = []
+        for row in rows:
+            tc_no = _get_tc_no_from_row(row)
+            grp = _tc_group(tc_no)
+            if grp and grp not in group_order:
+                group_order.append(grp)
+
+        for i, grp in enumerate(group_order):
+            group_to_state[grp] = state_selection[i % len(state_selection)]
+
+        _me_prefix_cycle = list(_ME_VALID_POLICY_PREFIXES)
+        _me_prefix_idx: dict[str, int] = {}  # track per-group so same group uses same prefix
+
+        for row in rows:
+            tc_no = _get_tc_no_from_row(row)
+            grp = _tc_group(tc_no)
+            state = group_to_state.get(grp, state_selection[0])
+
+            # Assign a consistent ME prefix per group
+            if state == "ME" and grp not in _me_prefix_idx:
+                _me_prefix_idx[grp] = len(_me_prefix_idx) % len(_me_prefix_cycle)
+
+            for key in list(row.keys()):
+                kl = key.lower().strip()
+                if "rating state" in kl:
+                    row[key] = state
+                elif kl == "company code":
+                    row[key] = _STATE_COMPANY.get(state, "0010")
+                elif kl == "agent":
+                    agents = _STATE_AGENTS.get(state, ["00130"])
+                    row[key] = agents[0]
+                elif kl in ("state",):
+                    # address State field — keep in sync with rating state
+                    row[key] = state
+                elif "policy #" in kl or kl == "policy #":
+                    current = str(row[key]).strip() if row[key] else ""
+                    if state == "ME":
+                        if current not in _ME_VALID_POLICY_PREFIXES:
+                            # Assign a valid ME prefix (vary per group)
+                            idx = _me_prefix_idx.get(grp, 0)
+                            row[key] = _me_prefix_cycle[idx % len(_me_prefix_cycle)]
+                    else:
+                        # CT / RI — HP is the safe default
+                        if current in _ME_VALID_POLICY_PREFIXES:
+                            row[key] = _CT_RI_DEFAULT_POLICY_PREFIX
+                elif kl == "loss free":
+                    # Loss free is ME-only; blank it for CT/RI
+                    if state != "ME":
+                        row[key] = ""
+                elif kl == "producer name":
+                    # Producer Name: CT only; blank for ME and RI
+                    if state != "CT":
+                        row[key] = ""
+
+    else:
+        # Driver / Vehicle / other sub-sheets: derive state from policy_rows
+        if policy_rows:
+            for prow in policy_rows:
+                tc_no = _get_tc_no_from_row(prow)
+                grp = _tc_group(tc_no)
+                if grp not in group_to_state:
+                    for key, val in prow.items():
+                        if "rating state" in key.lower():
+                            group_to_state[grp] = str(val).strip() if val else state_selection[0]
+                            break
+
+        for row in rows:
+            tc_no = _get_tc_no_from_row(row)
+            grp = _tc_group(tc_no)
+            state = group_to_state.get(grp, state_selection[0])
+
+            for key in list(row.keys()):
+                kl = key.lower().strip()
+                if sheet_type == "driver" and "lic state" in kl:
+                    row[key] = state
+                elif sheet_type == "vehicle" and kl == "state":
+                    row[key] = state
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Policy-structure parsing (drives row expansion for downstream sheets)
 # ---------------------------------------------------------------------------
 
@@ -344,16 +481,21 @@ def build_row_mapping_instructions(
 
     elif sheet_type == "summary":
         row_num = 0
+        # Each test case group may have multiple transactions — emit one Summary row per transaction
         for ps in policy_structure:
-            row_num += 1
-            lines.append(
-                f"  Row {row_num}: Test Case No = \"{ps['test_case_no']}\", "
-                f"Transactions = \"{ps['transaction_type']}\", "
-                f"Test Case Details = \"{ps['test_case_details']}\""
-            )
+            # ps["transactions"] is a list of (test_case_no_full, txn_type) if available,
+            # otherwise fall back to the single row stored in ps
+            transactions = ps.get("transactions") or [(ps["test_case_no"], ps["transaction_type"])]
+            for tc_no, txn_type in transactions:
+                row_num += 1
+                lines.append(
+                    f"  Row {row_num}: Test Case No = \"{tc_no}\", "
+                    f"Transactions = \"{txn_type}\", "
+                    f"Test Case Details = \"{ps['test_case_details']}\""
+                )
         return (
             "EXACT ROW MAPPING FOR SUMMARY SHEET:\n"
-            f"You MUST generate exactly {row_num} rows:\n"
+            f"You MUST generate exactly {row_num} rows — one per POLICY SHEET ROW:\n"
             + "\n".join(lines)
             + "\n\nExecute Transaction = \"No\", Hold Transaction = \"No\"."
             + "\nAll other fields (Wins Reference Quote, Python Reference Quote, Wins Issued Policy Number, "
@@ -429,6 +571,92 @@ def build_row_mapping_instructions(
 
 
 # ---------------------------------------------------------------------------
+# Policy sheet transaction structure template
+# ---------------------------------------------------------------------------
+
+# Cycled in order for each test case group.
+# Each entry: (scenario_label, [(transaction_type, cancel_hint), ...])
+# Each scenario: (label, driver_vehicle_combo, [(txn_type, hint), ...])
+# driver_vehicle_combo sets Test Case Details and drives sub-sheet row counts.
+_POLICY_SCENARIOS: list[tuple[str, str, list[tuple[str, str]]]] = [
+    ("Endorsement — 2 Driver & 2 Vehicle", "2 Driver & 2 Vehicle", [
+        ("New Business", ""),
+        ("Endorsement", "Policy Change=Yes AND Driver Change=Yes AND Vehicle Change=Yes"),
+    ]),
+    ("Mid-Term Cancel + Reinstatement — 1 Driver & 1 Vehicle", "1 Driver & 1 Vehicle", [
+        ("New Business", ""),
+        ("Cancellation", "Mid Term Cancel — Cancel Date AFTER effective date; Cancel Reason MANDATORY"),
+        ("Reinstatement", "Reinstate Date = Cancel Date; Reinstatement Reason in Endorsement Comments"),
+    ]),
+    ("Flat Cancel + Add From Cancel — 2 Driver & 1 Vehicle", "2 Driver & 1 Vehicle", [
+        ("New Business", ""),
+        ("Cancellation", "Flat Cancel — Cancel Date EQUALS effective date; Cancel Reason MANDATORY"),
+        ("Add From Cancel", ""),
+    ]),
+    ("Two Endorsements — 1 Driver & 2 Vehicle", "1 Driver & 2 Vehicle", [
+        ("New Business", ""),
+        ("Endorsement", "Policy Change=Yes AND Vehicle Change=Yes"),
+        ("Endorsement", "Policy Change=Yes AND Vehicle Change=Yes"),
+    ]),
+    ("Endorsement + Retroactive — 3 Driver & 1 Vehicle", "3 Driver & 1 Vehicle", [
+        ("New Business", ""),
+        ("Endorsement", "Policy Change=Yes AND Driver Change=Yes"),
+        ("Endorsement", "Policy Change=Yes"),
+        ("Retroactive", "Retro Option = 1 (Endorsement behavior)"),
+    ]),
+    ("Renewal — 1 Driver & 1 Vehicle", "1 Driver & 1 Vehicle", [
+        ("New Business", "effective date must be 300+ days in the past"),
+        ("Renewal", ""),
+    ]),
+]
+
+
+def build_policy_sheet_template(n_groups: int) -> tuple[int, str]:
+    """
+    Build an explicit row-by-row transaction plan for the Policy sheet.
+
+    Returns (total_row_count, template_text) where total_row_count is the
+    actual number of rows the LLM must generate across all groups.
+    """
+    lines: list[str] = []
+    total_rows = 0
+
+    for g in range(n_groups):
+        scenario_label, combo, transactions = _POLICY_SCENARIOS[g % len(_POLICY_SCENARIOS)]
+        group_id = f"TS-{g + 1:02d}"
+        group_rows = len(transactions)
+        total_rows += group_rows
+
+        lines.append(f"\nTest Case Group {group_id} ({group_rows} rows) — {scenario_label}:")
+        lines.append(f"  Test Case Details for ALL rows in this group: \"{combo}\"")
+        for t_idx, (txn_type, hint) in enumerate(transactions):
+            row_no = f"{group_id}-{t_idx + 1:02d}"
+            hint_str = f"  [{hint}]" if hint else ""
+            lines.append(f"  {row_no}: Transaction Type = \"{txn_type}\"{hint_str}")
+
+    template = (
+        "POLICY SHEET TRANSACTION STRUCTURE (MANDATORY):\n"
+        f"row_count={n_groups} means {n_groups} test case GROUPS, NOT individual rows.\n"
+        f"You MUST generate EXACTLY {total_rows} rows total in the Policy sheet:\n"
+        + "\n".join(lines)
+        + "\n\nThe Test Case No, Transaction Types, and Test Case Details above are FIXED — do NOT alter them."
+        "\nFor each row, generate realistic field values per the POLICY SHEET RULES."
+        "\nInsured Name must be IDENTICAL across all transactions of the same test case group."
+        "\nEffective Date must be IDENTICAL across all transactions of the same group (except Renewal)."
+        "\nFor Renewal rows: use an effective date 300+ days in the past."
+        "\nPolicy Change / Driver Change / Vehicle Change / Assignment Change:"
+        "\n  Always 'Yes' for New Business."
+        "\n  Follow the per-row hints above for Endorsement rows."
+        "\n  Always 'No' for Cancellation and Reinstatement."
+        "\nPolicy# (Policy #) field: NEVER leave blank when Account field is populated."
+        "\n  ME state: MUST be one of AUT, DWL, HOM, SON, PIM — never blank, never HP, never HW."
+        "\n  CT/RI state: HP or HW depending on Credit Company."
+    )
+
+    return total_rows, template
+
+
+# ---------------------------------------------------------------------------
 # Hardcoded PAP rule blocks (injected into the LLM prompt).
 # These apply regardless of whether a rule book is provided — they encode
 # the non-negotiable Quincy-PAP constraints.
@@ -470,7 +698,8 @@ POLICY SHEET RULES:
 - Policy Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any policy field changed, No otherwise. Always No for Cancellation/Reinstatement.
 - Driver Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any driver field changed, No otherwise. Always No for Cancellation/Reinstatement.
 - Vehicle Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any vehicle field changed, No otherwise. Always No for Cancellation/Reinstatement.
-- Assignment Change: Yes (default for New Business). For Endorsement/Renewal/Retroactive/Add From Cancel: Yes if any assignment field changed, No otherwise. Always No for Cancellation/Reinstatement.
+- Assignment Change: ONLY Yes when a driver or vehicle is physically ADDED or DELETED (Transaction="Add" or "Delete" in Driver/Vehicle sheet). If an endorsement only EDITS existing drivers/vehicles, Assignment Change MUST be No — the ordinal assignment does not change for edits.
+  Always No for Cancellation/Reinstatement.
 - Test Case Details: This field is the single source of truth for driver and vehicle counts across ALL sheets.
   Format: "X Driver & Y Vehicle" where X = number of drivers, Y = number of vehicles.
 - Effective Date: MMDDYYYY format (8 digits, NO slashes, NO dashes). Current date ±60 days.
@@ -478,53 +707,69 @@ POLICY SHEET RULES:
   Exception: Renewal transaction gets its own effective date (300+ days in the past).
   Effective date for any test case with Renewal must be 300 days in the past.
 - Endorsement Date: MMDDYYYY format (NO slashes).
+  CRITICAL: Endorsement Date MUST always be GREATER THAN OR EQUAL TO the Effective Date. It can NEVER be earlier than the Effective Date.
   For New Business: Endorsement Date = Effective Date (must be identical).
-  For Endorsement: >= New Business date and < 50 days in future.
-  For Cancellation: > New Business date.
+  For Endorsement: >= Effective Date and within 50 days in future. Each subsequent endorsement date must be >= the prior endorsement date.
+  For Cancellation: > Effective Date (Mid-Term) or = Effective Date (Flat Cancel).
   For Reinstatement: same as Cancellation date.
-  For Retroactive: same as the PREVIOUS Endorsement date.
+  For Retroactive: Retro Endorsement Date must be STRICTLY EARLIER THAN the most recent Endorsement Date in the same test case (not equal — it must be a date before the last endorsement).
   For Add From Cancel: same as Cancellation date.
+- Cancel Reason: MANDATORY for ALL Cancellation rows (any value from: Non-Payment, Insured Request,
+  Flat Cancel, Underwriting, Non-Renewal). NEVER blank on a Cancellation row.
+- Reinstatement Reason: MANDATORY for ALL Reinstatement rows (any value from: Payment Received,
+  Insured Request, Underwriting Approval). NEVER blank on a Reinstatement row.
 - Retro active / Retro Option: only mandatory for Retroactive transactions.
   Endorse and option = 1 (same as Endorsement), Final Cancel and option = 3 (same as Cancellation),
   Reinstate and option = 4 (same as Reinstatement).
 - Rating state = ME (default unless overridden):
-    Company Code = 0020, Agent = 05899 or 05297 or 05899, Loss Free = 1-9 (any number)
+    Company Code = 0020, Agent = 05899 or 05297, Loss Free = 1-9 (any number)
     Type, UMPD, CT PIP-BRB = Blank (these are CT-only fields)
+    Valid ME city/zip pairs (use ONLY these): Portland/04101, Portland/04102, Bangor/04401,
+    Lewiston/04240, Auburn/04210, South Portland/04106, Augusta/04330, Biddeford/04005,
+    Sanford/04073, Saco/04072
 - Rating state = RI: Company Code = 0010, Agent = 00130
+    Valid RI city/zip pairs (use ONLY these): Providence/02903, Cranston/02910, Warwick/02886,
+    Pawtucket/02860, East Providence/02914, Woonsocket/02895, Cumberland/02864, North Providence/02904
 - Rating state = CT: Company Code = 0010, Agent = 00130
+    Valid CT city/zip pairs (use ONLY these): Hartford/06103, New Haven/06511, Bridgeport/06604,
+    Stamford/06901, Waterbury/06702, Norwalk/06850, Danbury/06810, New Britain/06051
 - Insured Name: Random US name for New Business. NO CHANGE for all subsequent transactions.
 - Phone Type: Cell, Home, or Work
 - Phone: 10 digits, format "1111111111" (no dashes, no spaces, no parentheses)
 - Email: ends with @test.com or @gmail.com
 
-TRANSACTION RULES FOR POLICY FIELDS:
-Each field below lists what is allowed per transaction type.
+TRANSACTION RULES FOR POLICY FIELDS (CRITICAL — LLM MUST generate variation):
 "No change" = value MUST remain identical to the previous transaction in the same test case.
+IMPORTANT: When Policy Change=Yes on an Endorsement, change 1–3 coverage or policy fields (not all fields — partial changes are realistic and expected).
+IMPORTANT: Across all test cases, at least 2 test cases MUST use Liability BI + UM/UIM BI + PD (not CSL).
 
-Liability CSL (125,000 / 200,000 / 300,000 / 500,000 / 1,000,000):
-  Mutually exclusive with Liability BI — cannot select both.
-  New Business: select one value. Endorsement: change only if Policy Change=Yes.
-  Cancellation/Reinstatement: no change. Add From Cancel: change if Policy Change=Yes.
-  Retroactive: if Option=1 same as Endorsement, else no change. Renewal: change if Policy Change=Yes.
+Coverage mode — choose ONE per test case and keep it for all transactions:
+  MODE A (CSL): Liability CSL populated, Liability BI = blank, UM/UIM BI = blank, PD = blank
+  MODE B (BI):  Liability BI populated, Liability CSL = blank, UM/UIM CSL = blank, PD = populated
 
-UM/UIM CSL (100,000 / 125,000 / 200,000 / 300,000 / 500,000 / 1,000,000):
-  Must be <= Liability CSL. Same transaction rules as Liability CSL.
+Liability CSL (125,000 / 200,000 / 300,000 / 500,000 / 1,000,000) — MODE A only:
+  New Business: pick any value. Endorsement with Policy Change=Yes: MUST change to a different value.
+  Cancellation/Reinstatement: no change. Add From Cancel/Retroactive Option 1/Renewal: change if Policy Change=Yes.
+
+UM/UIM CSL (100,000 / 125,000 / 200,000 / 300,000 / 500,000 / 1,000,000) — MODE A only:
+  Must be <= Liability CSL. Same transaction rules as Liability CSL. Change value in Endorsements.
 
 Med Pay (2,000 / 5,000 / 10,000 / 25,000 / 50,000):
-  Same transaction rules as Liability CSL.
+  Same transaction rules as Liability CSL. Must change when Policy Change=Yes.
 
-Liability BI (50/100 / 100/300 / 250/500 / 500/1,000):
-  Mutually exclusive with Liability CSL. Same transaction rules.
+Liability BI (50/100 / 100/300 / 250/500 / 500/1,000) — MODE B only:
+  New Business: pick any value. Endorsement with Policy Change=Yes: MUST change to a different value.
+  Cancellation/Reinstatement: no change.
 
-UM/UIM BI (20/40 / 25/50 / 50/100 / 100/200 / 100/300 / 250/500 / 500/1,000):
-  Must be <= Liability BI. Only if Liability BI selected. Same transaction rules.
+UM/UIM BI (20/40 / 25/50 / 50/100 / 100/200 / 100/300 / 250/500 / 500/1,000) — MODE B only:
+  Must be <= Liability BI. Same transaction rules. Change value in Endorsements.
 
-PD (25,000 / 50,000 / 100,000 / 250,000):
-  Only if Liability BI is selected. Same transaction rules.
+PD (25,000 / 50,000 / 100,000 / 250,000) — MODE B only:
+  Same transaction rules as Liability BI. Must change when Policy Change=Yes.
 
-Type (Standard/Conversion): CT only. Same transaction rules.
-UMPD (25,000 / 50,000): CT and RI only. Blank for ME.
-CT PIP-BRB (Yes/blank): CT only. Blank if Med Pay selected.
+Type (Standard/Conversion): CT only. Endorsement with Policy Change=Yes: change value.
+UMPD (25,000 / 50,000): CT and RI only. Blank for ME. Can change when Policy Change=Yes.
+CT PIP-BRB (Yes/blank): CT only. Blank if Med Pay selected. Can change when Policy Change=Yes.
 
 Payment Plan: one value for entire test case.
   Options: "Direct Bill - 2 Pay", "Direct Bill - 4 Pay", "Direct Bill - 9 Pay",
@@ -538,9 +783,11 @@ Monthly Due Day: fill ONLY if Payment Plan = "EFT - 10 Pay Pick a Day". Value: 1
 - Less than 3 years at current address = Yes: fill Previous Street/City/State/ZIP. No = leave blank.
 - Umbrella Endorsement Written with Quincy: Yes or blank.
 - Account: Yes or blank. If blank, Policy# and Policy No must also be blank.
-- Credit Company: RI only. Quincy Mutual GRP (fill Policy#/No), Narragansett/Andover (no fill).
-- Policy# options for CT/RI: Quincy='HP', NEMIC='HW', Andover='HP', Quincy Grp=TBD.
-  For ME: AUT / DWL / HOM / SON / PIM.
+- Credit Company: RI state only. "Quincy Mutual GRP" → fill Policy# and Policy No. "Narragansett" or "Andover" → Policy# and Policy No must be blank.
+- Policy# valid values (NEVER leave Policy# blank when Account is populated):
+    ME state ONLY: AUT / DWL / HOM / SON / PIM  (DO NOT use HP, HW for ME — they are FORBIDDEN)
+    CT and RI states ONLY: Quincy → 'HP', NEMIC → 'HW', Andover → 'HP', Quincy Grp → TBD
+    CRITICAL: If Account has any value, Policy# MUST be filled. Blank Policy# is only allowed if Account is also blank.
 - Policy No: 806993 or 806995 (fill only if Policy# is selected, blank if Account is blank)
 - Loss Free: ME state only, value 1-9.
 - Group (Yes/blank), Corporate Car (Yes/blank): any state.
@@ -603,6 +850,13 @@ Add Infraction (Yes/blank):
   Cancellation/Reinstatement: no change. Add From Cancel: change if Driver Change=Yes.
   Retroactive Option 1: same as Endorsement. Renewal: change if Driver Change=Yes.
 
+MANDATORY VARIATION RULES (CRITICAL — must follow without exception):
+- DRIVER CHANGE IN ENDORSEMENTS: Out of every 3 endorsement transactions, AT LEAST 1 MUST have
+  Driver Change=Yes. If you have 5 endorsements, at least 2 must set Driver Change=Yes.
+  Do NOT set all endorsement rows to Driver Change=No.
+- When Driver Change=Yes on any row: the Transaction field for EVERY driver in the Driver sheet
+  for that row MUST be "Edit". Change 1–2 driver fields (e.g. Marital Status, Occupation) — partial changes are realistic, do NOT change every field.
+- Add Infraction: at least 1 driver across ALL test cases MUST have Add Infraction=Yes (to generate infraction data).
 - License Date: Date of Birth + 18 years, MMDDYYYY format (NO slashes).
 - Lic State: CT, RI, or ME. Preferably same as Rating State.
 - License #: CT = 9 digits, ME = 7 digits, RI = 7-9 digits.
@@ -672,6 +926,13 @@ Suspend Liability: must equal Delete Liability (both Yes or both blank). Same tr
   Endorsement: change if Vehicle Change=Yes. Cancellation/Reinstatement: no change.
 - Stated Amt: 1,000-100,000 (no $). ONLY for: Classic, Antique, Utility Trailer. Same transaction rules.
 - Customized Amt: thousands format (2,000/5,000/10,000/20,000/35,000/45,000/60,000). Same transaction rules.
+
+MANDATORY VARIATION RULES (CRITICAL — must follow without exception):
+- VEHICLE CHANGE IN ENDORSEMENTS: Out of every 3 endorsement transactions, AT LEAST 1 MUST have
+  Vehicle Change=Yes. If you have 5 endorsements, at least 2 must set Vehicle Change=Yes.
+  Do NOT set all endorsement rows to Vehicle Change=No.
+- When Vehicle Change=Yes on any row: the Transaction field for EVERY vehicle in the Vehicle sheet
+  for that row MUST be "Edit". Change 1–2 vehicle fields (e.g. Comp Ded, Veh Use) — partial changes are realistic, do NOT change every field.
 """
 
 ASSIGNMENT_SHEET_RULES = """
@@ -734,12 +995,13 @@ TRANSACTION RULES FOR INFRACTION:
 
 SUMMARY_SHEET_RULES = """
 SUMMARY SHEET RULES:
-- Test Case No: same as Policy sheet Test Case No
-- Transactions: same as Policy sheet Transaction Type
-- Execute Transaction: default "No"
-- Hold Transaction: default "No"
-- Test Case Details: same as Policy sheet Test Case Details
-- All other fields (Wins Reference Quote, Python Reference Quote, Wins Issued Policy Number, Python Issued Policy Number, Wins Premium, Python Premium, Status, Wins Screenshot Link, Python Screenshot Link): ALWAYS BLANK
+- One row per POLICY SHEET ROW — every transaction gets its own Summary row (not just New Business).
+- Test Case No: MUST match exactly the Policy sheet Test Case No for that row (e.g. TS-01-01, TS-01-02).
+- Transactions: MUST match exactly the Policy sheet Transaction Type for that row (e.g. "New Business", "Endorsement", "Cancellation").
+- Execute Transaction: always "No" (user changes manually).
+- Hold Transaction: always "No" (user changes manually).
+- Test Case Details: MUST match exactly the Policy sheet Test Case Details for that row.
+- ALL other fields (Wins Reference Quote, Python Reference Quote, Wins Issued Policy Number, Python Issued Policy Number, Wins Premium, Python Premium, Status, Wins Screenshot Link, Python Screenshot Link): ALWAYS BLANK — never populate these.
 """
 
 POLICY_INFO_SHEET_RULES = """
@@ -1038,6 +1300,50 @@ def _normalize_pap_dates(
     return rows
 
 
+def _fix_policy_dates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ensure Endorsement Date is never earlier than Effective Date (D44).
+
+    For each row:
+    - If Endorsement Date < Effective Date → set Endorsement Date = Effective Date.
+    - For New Business rows: Endorsement Date must equal Effective Date.
+    Both dates are in MMDDYYYY format (8 digits).
+    """
+    def _parse_mmddyyyy(val: str) -> int | None:
+        v = re.sub(r"[/\-]", "", str(val or "").strip())
+        if len(v) == 8 and v.isdigit():
+            try:
+                mm, dd, yyyy = int(v[:2]), int(v[2:4]), int(v[4:])
+                return yyyy * 10000 + mm * 100 + dd
+            except ValueError:
+                pass
+        return None
+
+    def _find_key(row: dict, *substrings: str) -> str | None:
+        for k in row:
+            kl = k.lower()
+            if all(s in kl for s in substrings):
+                return k
+        return None
+
+    for row in rows:
+        eff_key = _find_key(row, "effective")
+        end_key = _find_key(row, "endorsement", "date")
+        if not eff_key or not end_key:
+            continue
+
+        eff_val = str(row.get(eff_key, "") or "").strip()
+        end_val = str(row.get(end_key, "") or "").strip()
+
+        eff_int = _parse_mmddyyyy(eff_val)
+        end_int = _parse_mmddyyyy(end_val)
+
+        if eff_int and end_int and end_int < eff_int:
+            # Endorsement Date is earlier than Effective Date — fix it
+            row[end_key] = re.sub(r"[/\-]", "", eff_val)
+
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Handler class (dispatcher-facing interface)
 # ---------------------------------------------------------------------------
@@ -1069,7 +1375,15 @@ class PapQuincyHandler:
             extra_parts.append(INFRACTION_TABLE)
 
         adjusted_row_count = original_row_count
-        if policy_data:
+
+        # Policy sheet: inject explicit transaction structure so the LLM
+        # generates multiple transactions per test case group.
+        if sheet_type == "policy" and not policy_data:
+            total_rows, template = build_policy_sheet_template(original_row_count)
+            extra_parts.append(template)
+            adjusted_row_count = total_rows
+
+        elif policy_data:
             policy_structure = parse_policy_structure(policy_data)
 
             expanded_count = calculate_expanded_row_count(sheet_type, policy_structure, driver_data)
@@ -1122,6 +1436,10 @@ class PapQuincyHandler:
         # ── Driver sheet: correct Age based on Date of Birth ─────────────────
         if sheet_type == "driver":
             rows = _fix_driver_ages(rows)
+
+        # ── Policy sheet: fix Endorsement Date < Effective Date (D44) ─────────
+        if sheet_type == "policy":
+            rows = _fix_policy_dates(rows)
 
         # ── All sheets: normalize date fields to MMDDYYYY (strip slashes) ────
         rows = _normalize_pap_dates(rows, sheet_type)

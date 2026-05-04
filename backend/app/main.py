@@ -1,3 +1,5 @@
+import re
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -16,25 +18,28 @@ from app.policies.ims import (
     enforce_lob_selection as _ims_enforce_lob_selection,
     enforce_state_selection as _ims_enforce_state_selection,
 )
+from app.policies.pap_quincy import enforce_pap_state_selection as _pap_enforce_state_selection
 
 load_dotenv()
 
 app = FastAPI()
 
 # Configure CORS with environment-aware origins
-origins = [
-    "http://localhost:5173",  # Development
-    "https://data-gen-ai-1.onrender.com",  # Production frontend
+_FIXED_ORIGINS = [
+    "http://localhost:5173",
+    "https://data-gen-ai-1.onrender.com",
 ]
 
-# Add additional frontend URL from environment if specified
 frontend_url = os.getenv("FRONTEND_URL")
-if frontend_url and frontend_url not in origins:
-    origins.append(frontend_url)
+if frontend_url and frontend_url not in _FIXED_ORIGINS:
+    _FIXED_ORIGINS.append(frontend_url)
+
+# Allow any device on a local network (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=_FIXED_ORIGINS,
+    allow_origin_regex=r"http://(192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -188,6 +193,16 @@ async def generate_data(request: dict):
             state_hint = f"states: {states_str}."
             augmented_special = f"{augmented_special}\n{state_hint}".strip() if augmented_special else state_hint
 
+    # PAP: inject user-selected driver/vehicle combination hint.
+    # This tells the LLM exactly which combo to use in Test Case Details.
+    # Goes at the TOP so it takes highest precedence over any default behavior.
+    if driver_count and vehicle_count and policy_type == "PAP":
+        combo_hint = (
+            f"DRIVER/VEHICLE COMBINATION: Use exactly {driver_count} Driver & {vehicle_count} Vehicle "
+            f"for ALL test cases. Test Case Details must be \"{driver_count} Driver & {vehicle_count} Vehicle\"."
+        )
+        augmented_special = f"{combo_hint}\n{augmented_special}".strip() if augmented_special else combo_hint
+
     try:
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
@@ -202,20 +217,20 @@ async def generate_data(request: dict):
         # sub-sheet rows where the LOB is toggled off.
         lob_flags: dict[int, dict[str, bool]] = {}
 
-        # Two-pass approach: process non-assignment sheets first so that
-        # policy/driver/vehicle data are always available when the assignment
-        # sheet is processed, regardless of workbook sheet order.
-        sheet_items = list(unique_headers_by_sheet.items())
-        non_assignment_sheets = [
-            (name, hdrs) for name, hdrs in sheet_items
-            if handler.detect_sheet_type(name) != "assignment"
-        ]
-        assignment_sheets = [
-            (name, hdrs) for name, hdrs in sheet_items
-            if handler.detect_sheet_type(name) == "assignment"
-        ]
+        # Process sheets in dependency order regardless of workbook sheet order:
+        #   policy → driver/vehicle/infraction → summary/policy_info/questions → assignment
+        # Summary, Policy Info, and Questions sheets all need policy_data, so they
+        # must come after Policy. Assignment needs driver+vehicle, so it stays last.
+        _SHEET_ORDER = {
+            "policy": 0, "driver": 1, "vehicle": 2, "infraction": 3,
+            "summary": 4, "policy_info": 5, "questions_remarks": 6, "assignment": 7,
+        }
+        sheet_items = sorted(
+            list(unique_headers_by_sheet.items()),
+            key=lambda x: _SHEET_ORDER.get(handler.detect_sheet_type(x[0]), 3),
+        )
 
-        for sheet_name, unique_headers in non_assignment_sheets + assignment_sheets:
+        for sheet_name, unique_headers in sheet_items:
             original_headers = original_headers_by_sheet[sheet_name]
 
             # Handler decides row count and sheet-specific prompt augmentation
@@ -290,6 +305,14 @@ async def generate_data(request: dict):
             if policy_type == "IMS" and state_selection and data:
                 data = _ims_enforce_state_selection(data, sheet_name, state_selection)
                 print(f"State selection enforced on '{sheet_name}': {state_selection}")
+
+            # PAP: deterministically enforce state selection across all sheets.
+            if policy_type == "PAP" and state_selection and data:
+                data = _pap_enforce_state_selection(
+                    data, sheet_name, state_selection,
+                    policy_rows=policy_data,
+                )
+                print(f"PAP state selection enforced on '{sheet_name}': {state_selection}")
 
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,

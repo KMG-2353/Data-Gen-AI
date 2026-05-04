@@ -2,6 +2,24 @@ import { useState, useRef, useEffect } from "react";
 import { ChevronDownIcon, XIcon, SearchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
+function useDropdownPosition(triggerRef: React.RefObject<HTMLElement | null>, open: boolean) {
+  const [style, setStyle] = useState<React.CSSProperties>({});
+  useEffect(() => {
+    if (!open || !triggerRef.current) return;
+    const rect = triggerRef.current.getBoundingClientRect();
+    const viewportW = window.innerWidth;
+    const left = Math.max(8, Math.min(rect.left, viewportW - rect.width - 8));
+    setStyle({
+      position: "fixed",
+      top: rect.bottom + 4,
+      left,
+      width: rect.width,
+      zIndex: 9999,
+    });
+  }, [open, triggerRef]);
+  return style;
+}
+
 interface MultiSelectSearchProps {
   options: { value: string; label: string }[];
   selected: string[];
@@ -22,7 +40,9 @@ function MultiSelectSearch({
   const [open, setOpen] = useState(false);
   const [search, setSearch] = useState("");
   const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const dropdownStyle = useDropdownPosition(triggerRef, open);
 
   useEffect(() => {
     function handleClickOutside(e: MouseEvent) {
@@ -35,7 +55,9 @@ function MultiSelectSearch({
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
   }, []);
 
   useEffect(() => {
@@ -66,6 +88,7 @@ function MultiSelectSearch({
   return (
     <div ref={containerRef} className={cn("relative w-full", className)}>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen(!open)}
         className={cn(
@@ -103,7 +126,7 @@ function MultiSelectSearch({
       </button>
 
       {open && (
-        <div className="absolute z-50 mt-1 w-full rounded-md border bg-popover text-popover-foreground shadow-md">
+        <div style={dropdownStyle} className="rounded-md border bg-popover text-popover-foreground shadow-md">
           <div className="flex items-center gap-2 border-b px-3 py-2">
             <SearchIcon className="size-4 text-muted-foreground shrink-0" />
             <input
@@ -112,7 +135,8 @@ function MultiSelectSearch({
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder={searchPlaceholder}
-              className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+              style={{ fontSize: "16px" }}
+              className="flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
             />
           </div>
           <div className="max-h-52 overflow-y-auto p-1">

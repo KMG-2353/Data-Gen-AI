@@ -93,8 +93,8 @@ function App() {
 	const [selectedLobs, setSelectedLobs] = useState<string[]>([]);
 	const [selectedStates, setSelectedStates] = useState<string[]>([]);
 	const [testCases, setTestCases] = useState(5);
-	const [vehicleCount, setVehicleCount] = useState(1);
-	const [driverCount, setDriverCount] = useState(1);
+	const [driverCount, setDriverCount] = useState<number | "">("");
+	const [vehicleCount, setVehicleCount] = useState<number | "">("");
 	const [generatedSheets, setGeneratedSheets] = useState<string[] | null>(null);
 
 	const isAutoPolicy = selectedLobs.some((lob) =>
@@ -147,10 +147,8 @@ function App() {
 					lob_type: lineOfBusiness,
 					lob_selection: selectedLobs,
 					state_selection: selectedStates,
-					...(isAutoPolicy && {
-						vehicle_count: vehicleCount,
-						driver_count: driverCount,
-					}),
+					...(isAutoPolicy && driverCount && { driver_count: driverCount }),
+					...(isAutoPolicy && vehicleCount && { vehicle_count: vehicleCount }),
 				}),
 			});
 
@@ -314,41 +312,28 @@ function App() {
 					/>
 				</div>
 
-				{/* Vehicle & Driver count — only for auto policies */}
+				{/* Driver & Vehicle counts — only for auto policies */}
 				{isAutoPolicy && (
-					<div className="w-full flex flex-col gap-3 rounded-lg border border-input p-4">
-						<p className="text-sm font-medium">
-							Auto Policy Configuration
-						</p>
-						<div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-							<div className="flex flex-col gap-1.5">
-								<label className="text-xs text-gray-500">
-									Number of Vehicles
-								</label>
-								<Input
-									type="number"
-									value={vehicleCount}
-									onChange={(e) =>
-										setVehicleCount(Math.max(1, Number(e.target.value)))
-									}
-									min={1}
-									max={50}
-								/>
-							</div>
-							<div className="flex flex-col gap-1.5">
-								<label className="text-xs text-gray-500">
-									Number of Drivers
-								</label>
-								<Input
-									type="number"
-									value={driverCount}
-									onChange={(e) =>
-										setDriverCount(Math.max(1, Number(e.target.value)))
-									}
-									min={1}
-									max={50}
-								/>
-							</div>
+					<div className="w-full flex gap-3">
+						<div className="flex flex-col gap-1 flex-1">
+							<p className="text-xs text-gray-500">Number of Drivers (optional)</p>
+							<Input
+								type="number"
+								min={1}
+								placeholder="e.g. 2"
+								value={driverCount}
+								onChange={(e) => setDriverCount(e.target.value === "" ? "" : Number(e.target.value))}
+							/>
+						</div>
+						<div className="flex flex-col gap-1 flex-1">
+							<p className="text-xs text-gray-500">Number of Vehicles (optional)</p>
+							<Input
+								type="number"
+								min={1}
+								placeholder="e.g. 3"
+								value={vehicleCount}
+								onChange={(e) => setVehicleCount(e.target.value === "" ? "" : Number(e.target.value))}
+							/>
 						</div>
 					</div>
 				)}
