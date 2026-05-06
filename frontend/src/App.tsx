@@ -23,7 +23,7 @@ const MULTILINE_LOBS = [
 	// "Commercial Auto",
 	"Property",
 ];
-const MONOLINE_LOBS = ["GL", "Personal Auto Policy"];
+const MONOLINE_LOBS = ["Personal Auto Policy"];
 
 const AUTO_POLICY_LOBS = ["Personal Auto Policy"];
 
@@ -190,7 +190,6 @@ function App() {
 		}
 	};
 
-
 	const lobOptions =
 		lineOfBusiness === "Monoline"
 			? MONOLINE_LOBS
@@ -316,23 +315,35 @@ function App() {
 				{isAutoPolicy && (
 					<div className="w-full flex gap-3">
 						<div className="flex flex-col gap-1 flex-1">
-							<p className="text-xs text-gray-500">Number of Drivers (optional)</p>
+							<p className="text-xs text-gray-500">
+								Number of Drivers (optional)
+							</p>
 							<Input
 								type="number"
 								min={1}
 								placeholder="e.g. 2"
 								value={driverCount}
-								onChange={(e) => setDriverCount(e.target.value === "" ? "" : Number(e.target.value))}
+								onChange={(e) =>
+									setDriverCount(
+										e.target.value === "" ? "" : Number(e.target.value),
+									)
+								}
 							/>
 						</div>
 						<div className="flex flex-col gap-1 flex-1">
-							<p className="text-xs text-gray-500">Number of Vehicles (optional)</p>
+							<p className="text-xs text-gray-500">
+								Number of Vehicles (optional)
+							</p>
 							<Input
 								type="number"
 								min={1}
 								placeholder="e.g. 3"
 								value={vehicleCount}
-								onChange={(e) => setVehicleCount(e.target.value === "" ? "" : Number(e.target.value))}
+								onChange={(e) =>
+									setVehicleCount(
+										e.target.value === "" ? "" : Number(e.target.value),
+									)
+								}
 							/>
 						</div>
 					</div>
