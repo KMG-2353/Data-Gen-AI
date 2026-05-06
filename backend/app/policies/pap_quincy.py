@@ -98,6 +98,10 @@ _STATE_AGENTS: dict[str, list[str]] = {
 _ME_VALID_POLICY_PREFIXES = {"AUT", "DWL", "HOM", "SON", "PIM"}
 _CT_RI_DEFAULT_POLICY_PREFIX = "HP"
 
+# Address data is now fully managed by address_service.py — no hardcoded
+# geographic data lives here. The post-processor receives a pre-validated
+# {TS-XX: {street, city, state, zip}} map from generate_verified_addresses().
+
 
 def _tc_group(tc_no: str) -> str:
     """Extract group prefix from a test case number, e.g. 'TS-01-02-01' → 'TS-01'."""
@@ -121,20 +125,22 @@ def enforce_pap_state_selection(
     sheet_name: str,
     state_selection: list[str],
     policy_rows: list[dict[str, Any]] | None = None,
+    pre_generated_addresses: dict[str, dict] | None = None,
 ) -> list[dict[str, Any]]:
-    """Deterministically enforce user-selected states across PAP sheets.
+    """Deterministically enforce user-selected states and verified addresses.
 
-    Policy sheet: assigns states to test case groups by cycling through
-    state_selection, then updates Rating state, Company Code, Agent, and
-    fixes any forbidden Policy# values.
+    Policy sheet: assigns states to test case groups, then overwrites Rating
+    state, Company Code, Agent, Policy#, and all address fields from the
+    pre_generated_addresses map (Census-verified, no hardcoded geo data).
 
     Driver sheet: updates Lic State to match the test case's rating state.
-    Vehicle sheet: updates garaging State to match the test case's rating state.
+    Vehicle sheet: updates garaging State and address to match the policy row.
     """
     if not state_selection or not rows:
         return rows
 
     sheet_type = detect_sheet_type(sheet_name)
+    addr_map: dict[str, dict] = pre_generated_addresses or {}
 
     # Build group→state map from policy_rows (used by driver/vehicle sheets)
     group_to_state: dict[str, str] = {}
@@ -151,15 +157,22 @@ def enforce_pap_state_selection(
         for i, grp in enumerate(group_order):
             group_to_state[grp] = state_selection[i % len(state_selection)]
 
+        # Previous address: use the *next* group's address so it's always distinct
+        prev_map: dict[str, dict] = {
+            group_order[i]: addr_map.get(group_order[(i + 1) % len(group_order)], {})
+            for i in range(len(group_order))
+        } if group_order else {}
+
         _me_prefix_cycle = list(_ME_VALID_POLICY_PREFIXES)
-        _me_prefix_idx: dict[str, int] = {}  # track per-group so same group uses same prefix
+        _me_prefix_idx: dict[str, int] = {}
 
         for row in rows:
             tc_no = _get_tc_no_from_row(row)
             grp = _tc_group(tc_no)
             state = group_to_state.get(grp, state_selection[0])
+            addr = addr_map.get(grp, {})
+            prev = prev_map.get(grp, {})
 
-            # Assign a consistent ME prefix per group
             if state == "ME" and grp not in _me_prefix_idx:
                 _me_prefix_idx[grp] = len(_me_prefix_idx) % len(_me_prefix_cycle)
 
@@ -170,33 +183,44 @@ def enforce_pap_state_selection(
                 elif kl == "company code":
                     row[key] = _STATE_COMPANY.get(state, "0010")
                 elif kl == "agent":
-                    agents = _STATE_AGENTS.get(state, ["00130"])
-                    row[key] = agents[0]
-                elif kl in ("state",):
-                    # address State field — keep in sync with rating state
-                    row[key] = state
+                    row[key] = _STATE_AGENTS.get(state, ["00130"])[0]
+                elif kl == "street" and addr:
+                    row[key] = addr["street"]
+                elif kl == "city" and addr:
+                    row[key] = addr["city"]
+                elif kl in ("state",) and addr:
+                    row[key] = addr["state"]
+                elif kl in ("zipcode", "zip code") and addr:
+                    row[key] = addr["zip"]
+                elif kl == "previous street" and prev and str(row.get(key) or "").strip():
+                    row[key] = prev.get("street", "")
+                elif kl == "previous city" and prev and str(row.get(key) or "").strip():
+                    row[key] = prev.get("city", "")
+                elif kl == "previous state" and str(row.get(key) or "").strip():
+                    row[key] = prev.get("state", state) if prev else state
+                elif kl == "previous zip" and prev and str(row.get(key) or "").strip():
+                    row[key] = prev.get("zip", "")
                 elif "policy #" in kl or kl == "policy #":
                     current = str(row[key]).strip() if row[key] else ""
                     if state == "ME":
                         if current not in _ME_VALID_POLICY_PREFIXES:
-                            # Assign a valid ME prefix (vary per group)
                             idx = _me_prefix_idx.get(grp, 0)
                             row[key] = _me_prefix_cycle[idx % len(_me_prefix_cycle)]
                     else:
-                        # CT / RI — HP is the safe default
                         if current in _ME_VALID_POLICY_PREFIXES:
                             row[key] = _CT_RI_DEFAULT_POLICY_PREFIX
                 elif kl == "loss free":
-                    # Loss free is ME-only; blank it for CT/RI
                     if state != "ME":
                         row[key] = ""
                 elif kl == "producer name":
-                    # Producer Name: CT only; blank for ME and RI
                     if state != "CT":
                         row[key] = ""
 
     else:
-        # Driver / Vehicle / other sub-sheets: derive state from policy_rows
+        # Driver / Vehicle / other sub-sheets: derive state and full address from policy rows.
+        # If pre_generated_addresses is available use it directly; otherwise fall back to
+        # reading city/zip from the already-processed policy_rows.
+        group_to_addr: dict[str, dict] = {}
         if policy_rows:
             for prow in policy_rows:
                 tc_no = _get_tc_no_from_row(prow)
@@ -206,11 +230,28 @@ def enforce_pap_state_selection(
                         if "rating state" in key.lower():
                             group_to_state[grp] = str(val).strip() if val else state_selection[0]
                             break
+                if grp not in group_to_addr:
+                    # Prefer pre-generated map; fall back to reading from the policy row
+                    if grp in addr_map:
+                        group_to_addr[grp] = addr_map[grp]
+                    else:
+                        pstreet = pcity = pzip = ""
+                        for key, val in prow.items():
+                            kl = key.lower().strip()
+                            if kl == "street":
+                                pstreet = str(val or "").strip()
+                            elif kl == "city":
+                                pcity = str(val or "").strip()
+                            elif kl in ("zipcode", "zip code"):
+                                pzip = str(val or "").strip()
+                        if pcity or pzip:
+                            group_to_addr[grp] = {"street": pstreet, "city": pcity, "zip": pzip}
 
         for row in rows:
             tc_no = _get_tc_no_from_row(row)
             grp = _tc_group(tc_no)
             state = group_to_state.get(grp, state_selection[0])
+            addr = group_to_addr.get(grp, {})
 
             for key in list(row.keys()):
                 kl = key.lower().strip()
@@ -218,6 +259,77 @@ def enforce_pap_state_selection(
                     row[key] = state
                 elif sheet_type == "vehicle" and kl == "state":
                     row[key] = state
+                elif sheet_type == "vehicle" and kl == "street" and addr:
+                    row[key] = addr.get("street", row[key])
+                elif sheet_type == "vehicle" and kl == "city" and addr:
+                    row[key] = addr.get("city", row[key])
+                elif sheet_type == "vehicle" and kl in ("zipcode", "zip code") and addr:
+                    row[key] = addr.get("zip", row[key])
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: field-level rule enforcement for Policy sheet
+# ---------------------------------------------------------------------------
+
+def enforce_pap_policy_field_rules(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministically enforce field-level rules that the LLM sometimes misses.
+
+    Currently enforces:
+    - UMPD must be blank for ME state (UMPD is CT/RI only).
+    - CT PIP-BRB and Type must be blank for ME state.
+    - Endorsement Date must be >= Effective Date for every row.
+    """
+    _MMDDYYYY = re.compile(r"^\d{8}$")
+
+    def _parse_date(val: str) -> tuple[int, int, int] | None:
+        v = (val or "").strip()
+        if _MMDDYYYY.match(v):
+            try:
+                return int(v[4:8]), int(v[0:2]), int(v[2:4])  # (year, month, day)
+            except ValueError:
+                pass
+        return None
+
+    for row in rows:
+        # Determine rating state for this row
+        state = ""
+        for key, val in row.items():
+            if "rating state" in key.lower():
+                state = str(val or "").strip().upper()
+                break
+
+        eff_val = end_val = ""
+        eff_key = end_key = ""
+        for key in row:
+            kl = key.lower().strip()
+            if "effective date" in kl or kl == "effective":
+                eff_key = key
+                eff_val = str(row[key] or "").strip()
+            elif "endorsement date" in kl or kl == "endorsement":
+                end_key = key
+                end_val = str(row[key] or "").strip()
+
+        # Blank ME-only-forbidden fields
+        if state == "ME":
+            for key in list(row.keys()):
+                kl = key.lower().strip()
+                if kl == "umpd":
+                    row[key] = ""
+                elif kl in ("ct pip-brb", "ct pip brb", "pip-brb", "pip brb"):
+                    row[key] = ""
+                elif kl == "type":
+                    # "Type" (Standard/Conversion) is CT-only; blank for ME
+                    row[key] = ""
+
+        # Enforce endorsement date >= effective date
+        if eff_key and end_key and eff_val and end_val:
+            eff_t = _parse_date(eff_val)
+            end_t = _parse_date(end_val)
+            if eff_t and end_t and end_t < eff_t:
+                # Endorsement before effective — set endorsement = effective as minimum
+                row[end_key] = eff_val
 
     return rows
 
@@ -723,16 +835,15 @@ POLICY SHEET RULES:
   Reinstate and option = 4 (same as Reinstatement).
 - Rating state = ME (default unless overridden):
     Company Code = 0020, Agent = 05899 or 05297, Loss Free = 1-9 (any number)
-    Type, UMPD, CT PIP-BRB = Blank (these are CT-only fields)
-    Valid ME city/zip pairs (use ONLY these): Portland/04101, Portland/04102, Bangor/04401,
-    Lewiston/04240, Auburn/04210, South Portland/04106, Augusta/04330, Biddeford/04005,
-    Sanford/04073, Saco/04072
+    Type, UMPD, CT PIP-BRB = ALWAYS BLANK for ME — never populate these fields for ME state.
+    Addresses (Street, City, State, Zip) are set by the system post-generation.
+    Do not attempt to generate accurate addresses — any placeholder value is acceptable here.
 - Rating state = RI: Company Code = 0010, Agent = 00130
-    Valid RI city/zip pairs (use ONLY these): Providence/02903, Cranston/02910, Warwick/02886,
-    Pawtucket/02860, East Providence/02914, Woonsocket/02895, Cumberland/02864, North Providence/02904
+    Addresses (Street, City, State, Zip) are set by the system post-generation.
+    Do not attempt to generate accurate addresses — any placeholder value is acceptable here.
 - Rating state = CT: Company Code = 0010, Agent = 00130
-    Valid CT city/zip pairs (use ONLY these): Hartford/06103, New Haven/06511, Bridgeport/06604,
-    Stamford/06901, Waterbury/06702, Norwalk/06850, Danbury/06810, New Britain/06051
+    Addresses (Street, City, State, Zip) are set by the system post-generation.
+    Do not attempt to generate accurate addresses — any placeholder value is acceptable here.
 - Insured Name: Random US name for New Business. NO CHANGE for all subsequent transactions.
 - Phone Type: Cell, Home, or Work
 - Phone: 10 digits, format "1111111111" (no dashes, no spaces, no parentheses)
@@ -771,10 +882,12 @@ Type (Standard/Conversion): CT only. Endorsement with Policy Change=Yes: change 
 UMPD (25,000 / 50,000): CT and RI only. Blank for ME. Can change when Policy Change=Yes.
 CT PIP-BRB (Yes/blank): CT only. Blank if Med Pay selected. Can change when Policy Change=Yes.
 
-Payment Plan: one value for entire test case.
+Payment Plan: one value chosen at New Business.
   Options: "Direct Bill - 2 Pay", "Direct Bill - 4 Pay", "Direct Bill - 9 Pay",
   "EFT - 10 Pay Pick a Day", "Direct Bill - One Pay 5% Discount", "EFT - 12 Month Installment Plan"
-  Endorsement: change if Policy Change=Yes. Cancellation/Reinstatement: no change.
+  Payment Plan does NOT need to change on every endorsement — keep it identical to the New Business
+  value across all subsequent transactions unless the user explicitly wants payment-plan changes.
+  Cancellation/Reinstatement: no change.
 
 Monthly Due Day: fill ONLY if Payment Plan = "EFT - 10 Pay Pick a Day". Value: 1-30.
 
@@ -954,13 +1067,20 @@ TRANSACTION RULES FOR ASSIGNMENT:
   All other types (Motorhome, Recreational Trailer, Utility Trailer, Antique, etc.) are SKIPPED — their
   Veh# column must be blank; no ordinal value should appear in that column.
 - N = count of ELIGIBLE (Private Passenger or Classic) vehicles in the transaction group.
-- Assignment uses backward circular rotation:
-    ordinal for eligible-driver i, eligible-vehicle j = (j - i) % N + 1 → "1st", "2nd", "3rd", …
+- Assignment ordinal rules:
+    N = 1 eligible vehicle → ordinal = driver rank: Driver 1=1st, Driver 2=2nd, Driver 3=3rd, …
+    N > 1 eligible vehicles → forward rotation: ordinal = (driver_index + vehicle_index) % N + 1
   Example (1 driver, 1 vehicle): Driver 1: Veh#1=1st
   Example (2 drivers, 1 vehicle): Driver 1: Veh#1=1st, Driver 2: Veh#1=2nd
+  Example (3 drivers, 1 vehicle): Driver 1: Veh#1=1st, Driver 2: Veh#1=2nd, Driver 3: Veh#1=3rd
   Example (2 drivers, 2 eligible vehicles):
     Driver 1: Veh#1=1st, Veh#2=2nd
     Driver 2: Veh#1=2nd, Veh#2=1st
+  Example (4 drivers, 5 eligible vehicles):
+    Driver 1: 1st, 2nd, 3rd, 4th, 5th
+    Driver 2: 2nd, 3rd, 4th, 5th, 1st
+    Driver 3: 3rd, 4th, 5th, 1st, 2nd
+    Driver 4: 4th, 5th, 1st, 2nd, 3rd
 - The EXACT row mapping below pre-computes all ordinals — follow it exactly.
 """
 
@@ -1301,22 +1421,33 @@ def _normalize_pap_dates(
 
 
 def _fix_policy_dates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Ensure Endorsement Date is never earlier than Effective Date (D44).
+    """Enforce date relationships in the Policy sheet (D44, D48, D52, D53).
 
-    For each row:
-    - If Endorsement Date < Effective Date → set Endorsement Date = Effective Date.
-    - For New Business rows: Endorsement Date must equal Effective Date.
-    Both dates are in MMDDYYYY format (8 digits).
+    Per test case (TS-XX), in row order:
+    - New Business: Endorsement Date = Effective Date.
+    - Endorsement: Endorsement Date STRICTLY > Effective Date and >= prior endorsement date.
+    - Cancellation:
+        * Flat Cancel  → Cancel Date = Effective Date and Endorsement Date = Effective Date.
+        * Mid-Term     → Cancel Date > Effective Date.
+    - Reinstatement: Reinstate Date = Cancel Date (and >= Effective Date).
+    - Add From Cancel: Endorsement Date = preceding Cancel Date.
+    - Retroactive: Retro Endorsement Date matches an EXISTING earlier endorsement
+      in the same test case (not the most recent one). Retro Endorsement Date2 mirrors it.
+    Dates are MMDDYYYY (8 digits).
     """
-    def _parse_mmddyyyy(val: str) -> int | None:
+    from datetime import date, timedelta
+
+    def _parse(val: str) -> date | None:
         v = re.sub(r"[/\-]", "", str(val or "").strip())
         if len(v) == 8 and v.isdigit():
             try:
-                mm, dd, yyyy = int(v[:2]), int(v[2:4]), int(v[4:])
-                return yyyy * 10000 + mm * 100 + dd
+                return date(int(v[4:]), int(v[:2]), int(v[2:4]))
             except ValueError:
-                pass
+                return None
         return None
+
+    def _fmt(d: date) -> str:
+        return f"{d.month:02d}{d.day:02d}{d.year:04d}"
 
     def _find_key(row: dict, *substrings: str) -> str | None:
         for k in row:
@@ -1325,22 +1456,192 @@ def _fix_policy_dates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 return k
         return None
 
+    # Group rows by test case (preserve order)
+    groups: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        grp = _tc_group(_get_tc_no_from_row(row))
+        groups.setdefault(grp, []).append(i)
+
+    for grp, idxs in groups.items():
+        eff_date: date | None = None
+        endorsement_dates: list[date] = []  # endorsement dates seen so far in this group
+        last_cancel_date: date | None = None
+
+        for ridx in idxs:
+            row = rows[ridx]
+            txn_key = _find_key(row, "transaction type")
+            txn = str(row.get(txn_key, "") or "").strip().lower() if txn_key else ""
+
+            eff_key = _find_key(row, "effective")
+            end_key = _find_key(row, "endorsement", "date")
+            cancel_key = _find_key(row, "cancel date")
+            reinstate_key = _find_key(row, "reinstate date")
+            retro_key = _find_key(row, "retro", "endorsement", "date")
+            retro2_key = None
+            for k in row:
+                kl = k.lower()
+                if "retro" in kl and "endorsement" in kl and "2" in kl:
+                    retro2_key = k
+                    break
+            cancel_reason_key = _find_key(row, "cancel reason")
+            cancel_reason = str(row.get(cancel_reason_key, "") or "").strip().lower() if cancel_reason_key else ""
+
+            cur_eff = _parse(row.get(eff_key)) if eff_key else None
+            if cur_eff:
+                eff_date = cur_eff if eff_date is None else eff_date
+                # Force same effective date across the group (except renewal)
+                if txn != "renewal" and eff_key and cur_eff != eff_date:
+                    row[eff_key] = _fmt(eff_date)
+
+            if not eff_date:
+                continue
+
+            if txn == "new business":
+                if end_key:
+                    row[end_key] = _fmt(eff_date)
+
+            elif txn in ("endorsement", "renewal", "issue from quote"):
+                if end_key:
+                    cur_end = _parse(row.get(end_key))
+                    target = cur_end
+                    if target is None or target <= eff_date:
+                        # Must be strictly after effective; pick day after the latest known endorsement
+                        baseline = max([eff_date] + endorsement_dates)
+                        target = baseline + timedelta(days=1)
+                    if endorsement_dates and target < max(endorsement_dates):
+                        target = max(endorsement_dates) + timedelta(days=1)
+                    row[end_key] = _fmt(target)
+                    endorsement_dates.append(target)
+
+            elif txn in ("cancellation", "flat cancel", "mid term cancel", "mid-term cancel"):
+                is_flat = "flat" in cancel_reason or txn == "flat cancel"
+                if cancel_key:
+                    cur_c = _parse(row.get(cancel_key))
+                    if is_flat:
+                        target = eff_date
+                    else:
+                        if cur_c is None or cur_c <= eff_date:
+                            baseline = max([eff_date] + endorsement_dates)
+                            target = baseline + timedelta(days=15)
+                        else:
+                            target = cur_c
+                    row[cancel_key] = _fmt(target)
+                    last_cancel_date = target
+                    if end_key:
+                        row[end_key] = _fmt(target)
+
+            elif txn == "reinstatement":
+                target = last_cancel_date or eff_date
+                if reinstate_key:
+                    row[reinstate_key] = _fmt(target)
+                if end_key:
+                    row[end_key] = _fmt(target)
+
+            elif txn == "add from cancel":
+                target = last_cancel_date or eff_date
+                if end_key:
+                    row[end_key] = _fmt(target)
+
+            elif txn == "retroactive":
+                # Retro Endorsement Date should match an existing earlier endorsement
+                # (not the most recent one) per defect #46 and #52.
+                if retro_key:
+                    if len(endorsement_dates) >= 2:
+                        # Pick the earliest endorsement that's not the latest
+                        earlier = sorted(endorsement_dates)[:-1]
+                        target = earlier[0]
+                    elif endorsement_dates:
+                        # Only one endorsement — retro must be earlier than it (use day before)
+                        target = endorsement_dates[0] - timedelta(days=1)
+                    else:
+                        target = eff_date
+                    row[retro_key] = _fmt(target)
+                    if retro2_key:
+                        row[retro2_key] = _fmt(target)
+                # Carry endorsement date forward (last endorsement)
+                if end_key and endorsement_dates:
+                    row[end_key] = _fmt(endorsement_dates[-1])
+
+    return rows
+
+
+def _enforce_me_state_blanks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Blank out fields that are not valid for ME state (D49, D50, D54).
+
+    For rows where Rating state == ME:
+    - Type, UMPD, CT PIP-BRB → blank
+    - Credit Company "Quincy Mutual GRP" → blank (RI-only field)
+    """
     for row in rows:
-        eff_key = _find_key(row, "effective")
-        end_key = _find_key(row, "endorsement", "date")
-        if not eff_key or not end_key:
+        state = ""
+        for k, v in row.items():
+            if "rating state" in k.lower():
+                state = str(v or "").strip().upper()
+                break
+        if state != "ME":
             continue
+        for k in list(row.keys()):
+            kl = k.lower().strip()
+            if kl == "type":
+                row[k] = ""
+            elif kl == "umpd":
+                row[k] = ""
+            elif "ct pip" in kl or kl == "ct pip-brb":
+                row[k] = ""
+            elif kl == "credit company":
+                row[k] = ""
+    return rows
 
-        eff_val = str(row.get(eff_key, "") or "").strip()
-        end_val = str(row.get(end_key, "") or "").strip()
 
-        eff_int = _parse_mmddyyyy(eff_val)
-        end_int = _parse_mmddyyyy(end_val)
+def _enforce_account_policy_consistency(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """If Account is blank/No, Policy # and Policy No must also be blank (D20, D55)."""
+    def _find(row, *subs):
+        for k in row:
+            kl = k.lower().strip()
+            if all(s in kl for s in subs):
+                return k
+        return None
 
-        if eff_int and end_int and end_int < eff_int:
-            # Endorsement Date is earlier than Effective Date — fix it
-            row[end_key] = re.sub(r"[/\-]", "", eff_val)
+    for row in rows:
+        account_key = None
+        for k in row:
+            if k.lower().strip() == "account":
+                account_key = k
+                break
+        if not account_key:
+            continue
+        val = str(row.get(account_key) or "").strip().lower()
+        is_blank = val in ("", "no", "n", "none")
+        if is_blank:
+            row[account_key] = ""
+            for k in list(row.keys()):
+                kl = k.lower().strip()
+                if "policy #" in kl or kl == "policy #" or kl == "policy no":
+                    row[k] = ""
+            # Credit Company is meaningless without Account
+            cc_key = _find(row, "credit company")
+            if cc_key:
+                row[cc_key] = ""
+    return rows
 
+
+def _enforce_yes_blank_fields(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Yes/blank fields: convert "No"/"None" to blank (D7, D9, D18, D19)."""
+    _YES_BLANK_FIELDS = (
+        "ct pip-brb", "ct pip",
+        "umbrella endorsement written with quincy",
+        "account", "group", "corporate car",
+        "loss free",  # Loss Free is numeric 1-9 — but "No" should still be blanked
+    )
+    for row in rows:
+        for k in list(row.keys()):
+            kl = k.lower().strip()
+            for f in _YES_BLANK_FIELDS:
+                if f in kl:
+                    val = str(row.get(k) or "").strip().lower()
+                    if val in ("no", "n", "none"):
+                        row[k] = ""
+                    break
     return rows
 
 
@@ -1437,8 +1738,11 @@ class PapQuincyHandler:
         if sheet_type == "driver":
             rows = _fix_driver_ages(rows)
 
-        # ── Policy sheet: fix Endorsement Date < Effective Date (D44) ─────────
+        # ── Policy sheet: enforce date relationships, ME blanks, Account/Policy consistency
         if sheet_type == "policy":
+            rows = _enforce_yes_blank_fields(rows)
+            rows = _enforce_me_state_blanks(rows)
+            rows = _enforce_account_policy_consistency(rows)
             rows = _fix_policy_dates(rows)
 
         # ── All sheets: normalize date fields to MMDDYYYY (strip slashes) ────

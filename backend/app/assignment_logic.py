@@ -7,8 +7,9 @@ assignment matrices per the Personal Auto Driver Assignment Implementation Plan.
 Eligible vehicle types: Private Passenger, Classic
 Eligible driver types:  Principal, Occasional
 
-Default pattern: Backward rotation  →  ordinal = (j - i) % N + 1
-Alternate pattern: Forward rotation →  ordinal = (i + j) % N + 1
+Pattern (per Quincy rule book):
+  N = 1 eligible vehicle : ordinal = driver_rank (1, 2, 3 …)
+  N > 1 eligible vehicles: Forward rotation → ordinal = (i + j) % N + 1
 """
 
 from __future__ import annotations
@@ -133,10 +134,12 @@ def compute_assignment_matrix(
             assignments = [""] * N
         elif N == 0:
             assignments = []
-        elif pattern == "backward":
-            # ordinal = (j - i) % N + 1
-            assignments = [to_ordinal((j - i) % N + 1) for j in range(N)]
+        elif N == 1:
+            # Single eligible vehicle: ordinal = driver rank (1st, 2nd, 3rd …)
+            # (modulo formula always gives 1 when N=1, so use index directly)
+            assignments = [to_ordinal(i + 1)]
         else:
+            # Forward rotation (matches Quincy rule book table):
             # ordinal = (i + j) % N + 1
             assignments = [to_ordinal((i + j) % N + 1) for j in range(N)]
 
@@ -347,8 +350,8 @@ def build_assignment_prompt_instructions(
 
             if N == 0:
                 veh_parts: list[str] = []
-            elif pattern == "backward":
-                veh_parts = [f'Veh #{j + 1} = "{to_ordinal((j - i) % N + 1)}"' for j in range(N)]
+            elif N == 1:
+                veh_parts = [f'Veh #1 = "{to_ordinal(i + 1)}"']
             else:
                 veh_parts = [f'Veh #{j + 1} = "{to_ordinal((i + j) % N + 1)}"' for j in range(N)]
 

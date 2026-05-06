@@ -437,7 +437,7 @@ IMPORTANT RULES:
 3. For policy numbers, use realistic formats used in United States.
 4. For currency amounts, use realistic insurance values
 5. Names should be diverse and realistic
-6. Addresses should be realistic US addresses related to the Rating State
+6. Address fields are managed by the system — generate any placeholder values.
 7. For vehicles, use exact data from the VIN table provided in the rules.
 8. All the Dollar values should be numbers and not in string. But should have a dollar sign before them.
 9. The effective date, endorsement date should match across all sheets for same test case.

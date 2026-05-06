@@ -18,7 +18,12 @@ from app.policies.ims import (
     enforce_lob_selection as _ims_enforce_lob_selection,
     enforce_state_selection as _ims_enforce_state_selection,
 )
-from app.policies.pap_quincy import enforce_pap_state_selection as _pap_enforce_state_selection
+from app.policies.pap_quincy import (
+    enforce_pap_state_selection as _pap_enforce_state_selection,
+    enforce_pap_policy_field_rules as _pap_enforce_field_rules,
+)
+from app.address_service import generate_verified_addresses as _generate_verified_addresses
+from app.llm_service import configure_openai as _configure_openai
 
 load_dotenv()
 
@@ -204,6 +209,26 @@ async def generate_data(request: dict):
         augmented_special = f"{combo_hint}\n{augmented_special}".strip() if augmented_special else combo_hint
 
     try:
+        # PAP: pre-generate Census-verified addresses before any sheet LLM call.
+        # The post-processor will overwrite all address fields from this map —
+        # the main LLM calls play no role in address generation.
+        _pap_verified_addresses: dict[str, dict] = {}
+        if policy_type == "PAP" and state_selection:
+            try:
+                _provider = os.getenv("MODEL_PROVIDER", "openai").lower()
+                _model = os.getenv(
+                    "GEMINI_MODEL" if _provider == "gemini" else "OPENAI_MODEL",
+                    "gpt-4o",
+                )
+                _pap_verified_addresses = _generate_verified_addresses(
+                    state_selection,
+                    n_groups=row_count,
+                    client=_configure_openai(),
+                    model=_model,
+                )
+            except Exception as _addr_exc:
+                print(f"[PAP] Address pre-generation failed (will fall back to LLM values): {_addr_exc}")
+
         # Generate data for ALL sheets sequentially, passing previous data for consistency
         generated_data_by_sheet = {}
         previous_sheets_data = {}
@@ -306,13 +331,19 @@ async def generate_data(request: dict):
                 data = _ims_enforce_state_selection(data, sheet_name, state_selection)
                 print(f"State selection enforced on '{sheet_name}': {state_selection}")
 
-            # PAP: deterministically enforce state selection across all sheets.
+            # PAP: deterministically enforce state selection + verified addresses.
             if policy_type == "PAP" and state_selection and data:
                 data = _pap_enforce_state_selection(
                     data, sheet_name, state_selection,
                     policy_rows=policy_data,
+                    pre_generated_addresses=_pap_verified_addresses,
                 )
                 print(f"PAP state selection enforced on '{sheet_name}': {state_selection}")
+
+            # PAP: enforce field-level rules (UMPD blank for ME, endorsement >= effective).
+            if policy_type == "PAP" and sheet_type == "policy" and data:
+                data = _pap_enforce_field_rules(data)
+                print(f"PAP field rules enforced on '{sheet_name}'")
 
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,
