@@ -23,7 +23,9 @@ def _parse_json_array(text: str) -> list[dict[str, Any]]:
     """Parse model output, extracting array from wrapped objects when needed."""
     cleaned = _clean_response_text(text)
 
-    parsed = json.loads(cleaned)
+    # raw_decode stops at the first complete JSON value, ignoring any trailing
+    # content the LLM may have appended (duplicate objects, commentary, etc.)
+    parsed, _ = json.JSONDecoder().raw_decode(cleaned)
 
     if isinstance(parsed, list):
         return parsed
