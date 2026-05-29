@@ -193,8 +193,13 @@ def _enforce_effective_expiration_date_range(
                 txn_type = str(val or "").strip().lower()
 
         # Group = first two dash-separated segments (TS-XX); handles TS-XX-YY-ZZ too
-        parts = tc_no.split("-")
-        tc_group = "-".join(parts[:2]) if len(parts) >= 2 else tc_no
+        # When no test case number exists (e.g. RRG sheets), use row index so each
+        # row gets its own unique effective date instead of all sharing the same one.
+        if not tc_no:
+            tc_group = f"__row_{idx}__"
+        else:
+            parts = tc_no.split("-")
+            tc_group = "-".join(parts[:2]) if len(parts) >= 2 else tc_no
 
         is_renewal = "renewal" in txn_type
         is_new_business = "new business" in txn_type
@@ -327,6 +332,18 @@ def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
     ims_header_signals = ["ds#", "test case no", "netrate"]
     if any(sig in h for h in all_headers_lower for sig in ims_header_signals):
         return "IMS"
+
+    # RRG Excel Rater: distinctive combination of rating sheets
+    rrg_signals = ["gl_rating", "pl_rating", "ebl_rating", "abuse_rating", "auto_rating"]
+    rrg_hits = sum(1 for kw in rrg_signals if any(kw in s for s in sheets_lower))
+    if rrg_hits >= 3:
+        return "RRG"
+
+    # RRG alternate: sheet names with spaces
+    rrg_spaced = ["gl rating", "pl rating", "ebl rating", "sched of vehicles"]
+    rrg_spaced_hits = sum(1 for kw in rrg_spaced if any(kw in s for s in sheets_lower))
+    if rrg_spaced_hits >= 2:
+        return "RRG"
 
     return "GENERIC"
 

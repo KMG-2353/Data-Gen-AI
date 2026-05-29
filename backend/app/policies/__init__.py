@@ -14,12 +14,14 @@ from .base import PolicyHandler
 from .generic import GenericHandler
 from .pap_quincy import PapQuincyHandler
 from .ims import ImsHandler
+from .rrg import RrgHandler
 
 
 _HANDLERS: dict[str, PolicyHandler] = {
     "GENERIC": GenericHandler(),
     "PAP": PapQuincyHandler(),
     "IMS": ImsHandler(),
+    "RRG": RrgHandler(),
 }
 
 
