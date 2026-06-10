@@ -48,11 +48,14 @@ class PolicyHandler(Protocol):
         policy_data: list[dict[str, Any]] | None,
         driver_data: list[dict[str, Any]] | None,
         vehicle_data: list[dict[str, Any]] | None,
+        previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]] | None:
         """Optionally generate rows deterministically (skip LLM).
 
         Returns None when the handler has no deterministic path for this
-        sheet, in which case the LLM path runs.
+        sheet, in which case the LLM path runs. `previous_sheets_data` carries
+        every already-generated sheet (keyed by sheet name) so summary sheets
+        can be assembled from upstream data.
         """
         ...
 

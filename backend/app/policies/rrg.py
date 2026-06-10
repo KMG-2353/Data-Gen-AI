@@ -26,6 +26,39 @@ def _parse_date(val: str):
             pass
     return None
 
+
+def _format_zip5(val) -> str | None:
+    """Normalize a ZIP value to a strict 5-digit string (Rules 3 / 10 / 28).
+
+    Strips non-digits, then either left-pads to 5 (preserving leading zeros
+    for CT/NJ ZIPs like 06103, 07102) or trims to 5 if longer. Returns the
+    cleaned string, or None when the input had no digits at all so callers
+    can decide to fall back on the insured's ZIP.
+    """
+    digits = "".join(ch for ch in str(val or "") if ch.isdigit())
+    if not digits:
+        return None
+    if len(digits) < 5:
+        return digits.zfill(5)
+    return digits[:5]
+
+
+def _format_us_phone(val) -> str:
+    """Format a contact/phone value as a USA 10-digit number "XXX XXX XXXX".
+
+    Strips every non-digit character, then groups the digits 3-3-4 separated by
+    single spaces (e.g. 2125550147 → "212 555 0147") per Rule 1 / Rule 9
+    [DS_044 / DS_045]. If the cleaned value is not exactly 10 digits a valid
+    10-digit number is fabricated (area code not starting with 0 or 1) so the
+    output always satisfies the format constraint.
+    """
+    digits = "".join(ch for ch in str(val or "") if ch.isdigit())
+    if len(digits) != 10:
+        digits = str(random.randint(2, 9)) + "".join(
+            str(random.randint(0, 9)) for _ in range(9)
+        )
+    return f"{digits[:3]} {digits[3:6]} {digits[6:]}"
+
 VALID_STATES = ["NY", "AL", "IL", "TX", "FL", "PA", "CT", "NJ"]
 
 VALID_ORG_TYPES = [
@@ -170,26 +203,71 @@ _CITIES_REFERENCE = "  " + "\n  ".join(
 )
 
 
+# Full allowed ranges per the RRG rulebook. The "checkpoints" are the
+# representative values a test set must cover so boundary/maximum scenarios are
+# exercised at high volume (DS_047 / DS_048 / DS_049). Small values dominate via
+# the fill pattern; checkpoints guarantee the spread reaches the documented max.
+LOCATION_COUNT_CHECKPOINTS = [1, 2, 3, 5, 8, 12, 16, 20]  # Rule 37: 1–20
+VEHICLE_COUNT_CHECKPOINTS = [1, 2, 3, 5, 8, 12, 16, 20]   # Rule 36: 1–20 (Auto=Yes)
+COB_COUNT_CHECKPOINTS = [1, 2, 3, 4, 5, 6, 7, 8]          # Rule 38: 1–8
+
+
+def _coverage_counts(
+    n: int, checkpoints: list[int], fill_pattern: list[int]
+) -> list[int]:
+    """Per-insured counts that guarantee full-range coverage at high volume.
+
+    Most insureds get the small, repeating ``fill_pattern`` values (keeping the
+    generated row volume sane). Once there are at least as many insureds as
+    checkpoints, the checkpoint values are overlaid at evenly spread positions so
+    the dataset provably contains the boundary and maximum counts (e.g. a 20-
+    location insured, an 8-CoB insured). Below that threshold the original light
+    cycling behavior is preserved, so small runs are unchanged.
+    """
+    if n <= 0:
+        return []
+    counts = [fill_pattern[i % len(fill_pattern)] for i in range(n)]
+    cps = sorted(set(checkpoints))
+    if n >= len(cps):
+        for j, cp in enumerate(cps):
+            pos = j * (n - 1) // (len(cps) - 1) if len(cps) > 1 else 0
+            counts[pos] = cp
+    return counts
+
+
 def _vehicle_counts_for_insureds(auto_insureds: list) -> list[int]:
-    """Return per-insured vehicle counts cycling [2, 1, 3] for variability (DS_033)."""
-    pattern = [2, 1, 3]
-    return [pattern[i % len(pattern)] for i in range(len(auto_insureds))]
+    """Per-insured vehicle counts spanning the full 1–20 range (DS_033 / DS_048)."""
+    return _coverage_counts(len(auto_insureds), VEHICLE_COUNT_CHECKPOINTS, [2, 1, 3])
 
 
 def _location_counts_for_insureds(policy_data: list) -> list[int]:
-    """Return per-insured location counts cycling [2, 3, 1] for variability (DS_035)."""
-    pattern = [2, 3, 1]
-    return [pattern[i % len(pattern)] for i in range(len(policy_data))]
+    """Per-insured location counts spanning the full 1–20 range (DS_035 / DS_047)."""
+    return _coverage_counts(len(policy_data), LOCATION_COUNT_CHECKPOINTS, [2, 3, 1])
 
 
 def _cob_counts_for_insureds(pl_insureds: list) -> list[int]:
-    """Return per-insured Class of Business counts cycling [2, 1, 2] for variability (DS_038).
+    """Per-insured Class of Business counts spanning the full 1–8 range (DS_038 / DS_049).
 
-    This ensures some insureds have multiple CoB rows (Rule 38) while others
-    have a single entry, creating realistic variability in PL Rating data.
+    This ensures some insureds have many CoB rows (up to the rulebook max of 8,
+    Rule 38) while others have a single entry, creating realistic variability and
+    full boundary coverage in PL Rating data.
     """
-    pattern = [2, 1, 2]
-    return [pattern[i % len(pattern)] for i in range(len(pl_insureds))]
+    return _coverage_counts(len(pl_insureds), COB_COUNT_CHECKPOINTS, [2, 1, 2])
+
+
+def _unit_suffix(v: int) -> str:
+    """Spreadsheet-style suffix for a vehicle unit index (0→A, 25→Z, 26→AA).
+
+    Supports vehicle counts well beyond the 5-letter range the prompt previously
+    assumed, so an insured with up to 20 vehicles (Rule 36 / DS_048) gets unique
+    unit labels without an index error.
+    """
+    letters = ""
+    v += 1
+    while v > 0:
+        v, rem = divmod(v - 1, 26)
+        letters = chr(ord("A") + rem) + letters
+    return letters
 
 
 def _build_insured_row_map(counts: list[int]) -> list[int]:
@@ -290,6 +368,9 @@ class RrgHandler:
             return "vehicles"
         if "auto_rating" in sn or sn == "auto rating":
             return "auto_rating"
+        # "Test Scenerio Details" (note the client's misspelling of "Scenario")
+        if "scenario" in sn or "scenerio" in sn:
+            return "scenario_details"
         sn_no_space = sn.replace(" ", "_").replace("-", "_")
         if any(ref in sn_no_space for ref in _REFERENCE_SHEETS):
             return "reference"
@@ -310,6 +391,11 @@ class RrgHandler:
         sheet_type = self.detect_sheet_type(sheet_name)
 
         if sheet_type == "reference":
+            return 0, ""
+
+        # Test Scenerio Details is a deterministic summary built in pre_generate
+        # from the already-generated sheets — never sent to the LLM.
+        if sheet_type == "scenario_details":
             return 0, ""
 
         codes_sample = ", ".join(VALID_CLASS_CODES[:30]) + ", ..."
@@ -355,7 +441,7 @@ class RrgHandler:
 RRG POLICY INFORMATION RULES (HARD CONSTRAINTS):
 - Test ID: MUST follow the format DS-01, DS-02, DS-03, ... (sequential, zero-padded).
   NEVER use prefixes like PI-, GL-, SL-, or any other format. Always "DS-XX".
-- Contact Number: 10-digit numeric only (no dashes, spaces, or special chars) [Rule 1]
+- Contact Number: USA 10-digit phone in "XXX XXX XXXX" format — three groups of 3-3-4 separated by single spaces (e.g. 212 555 0147). No dashes, parentheses, or other special chars [Rule 1 / DS_044]
 - State: MUST be one of {VALID_STATES} [Rule 2]
 - ZIP Code: 5-digit numeric only [Rule 3]
 - Org Type / Entity: MUST be one of {VALID_ORG_TYPES} [Rule 4]
@@ -363,7 +449,7 @@ RRG POLICY INFORMATION RULES (HARD CONSTRAINTS):
 - Rating State: MUST be one of {VALID_STATES} [Rule 6]
 - New / Renewal: MUST be "New Business" or "Renewal" [Rule 7]
 - GL (Yes/No): ALWAYS "Yes" — GL is mandatory for all insureds [Rule 8]
-- Producer Phone: 10-digit numeric only (no dashes or spaces) [Rule 9]
+- Producer Phone: USA 10-digit phone in "XXX XXX XXXX" format — three groups of 3-3-4 separated by single spaces (e.g. 646 555 0198) [Rule 9 / DS_045]
 - Effective Date: MM/DD/YYYY format (e.g. 05/28/2026) — MUST VARY across rows, not all the same
 - Expiration Date: MM/DD/YYYY format, exactly 1 year after effective date — MUST match effective date's year+1
 - Country: Always "USA"
@@ -423,12 +509,13 @@ LOB DISTRIBUTION — each optional LOB MUST have a realistic mix of Yes and No:
             rules = f"""
 RRG SCHEDULE OF LOCATIONS RULES (HARD CONSTRAINTS):
 - Test ID: MUST use the same DS-01, DS-02, ... IDs from Policy Information. NEVER invent new IDs like SL-001.
+- "#": per-insured location number that RESTARTS at 1 for each insured's first location (1, 2, 3 within each Test ID) — NOT a global running count across all insureds [DS_043]
 - State: MUST be one of {VALID_STATES} [Rule 11]
 - ZIP: 5-digit numeric only [Rule 10]
 - Class Code: MUST be from approved list: {codes_sample} [Rule 13]
 - City, State, ZIP must be geographically consistent [Rule 12]
 - Exposure Amount: realistic dollar value (e.g. $250000)
-- Location counts VARY per insured (1, 2, or 3) — follow the per-insured counts below [Rule 37]
+- Location counts VARY per insured across the full 1–20 range — follow the exact per-insured counts below [Rule 37]
 - Location Name: "Primary Office" / "Main Clinic" for row 1; "Branch Office" / "Secondary Location" for extras
 - City MUST be a real city inside the chosen State.
 - Street address MUST be a real street that exists in the chosen CITY — NEVER use a street from another city.
@@ -508,7 +595,7 @@ RRG PL RATING RULES (HARD CONSTRAINTS):
 - Count: numeric integer only [Rule 20]
 - Hazard Tier: MUST be "Moderate" or "High" [Rule 21]
 - An insured MUST have MULTIPLE Class of Business rows — each in a separate row with a different CoB value [Rule 38]
-  * Some insureds get 2 CoB rows, others get 1 — vary it across insureds for realistic data
+  * Class of Business counts VARY per insured across the full 1–8 range — follow the exact per-insured counts below
   * Each row for the same insured uses the SAME Test ID but a DIFFERENT Class of Business
 {insured_block}
 """
@@ -581,7 +668,7 @@ RRG ABUSE RATING RULES (HARD CONSTRAINTS):
                     zipcode = ins.get("ZIP Code", "?")
                     veh_lines = []
                     for v in range(count):
-                        unit = f"{i:02d}{'ABCDE'[v]}"
+                        unit = f"{i:02d}{_unit_suffix(v)}"
                         veh_lines.append(f"    Row {row_num + v}: Unit #{unit} — vehicle {v+1} of {count}")
                     lines.append(
                         f"  Insured {i}: {name} — {count} vehicle(s), State: {state}, ZIP: {zipcode}\n"
@@ -601,7 +688,8 @@ RRG ABUSE RATING RULES (HARD CONSTRAINTS):
             rules = f"""
 RRG SCHEDULE OF VEHICLES RULES (HARD CONSTRAINTS):
 - ONLY generate rows for insureds where Auto (Yes/No) = "Yes" in Policy Information [Rule 36]
-- Generate 2 vehicles per Auto=Yes insured — different Vehicle Types for each [Rule 36]
+- EVERY Auto=Yes insured MUST have at least 1 vehicle and at most 20 — NEVER leave an Auto=Yes insured with zero vehicle rows [Rule 36 / DS_046]
+- Follow the per-insured vehicle counts listed below; use a different Vehicle Type for each vehicle of the same insured [Rule 36]
 - Vehicle Type: MUST be EXACTLY one of (use double-hyphen --): [Rule 26]
   {vehicle_list}
 - Garaging State: MUST match the insured's Rating State [Rule 27]
@@ -653,9 +741,16 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         policy_data: list[dict[str, Any]] | None,
         driver_data: list[dict[str, Any]] | None,
         vehicle_data: list[dict[str, Any]] | None,
+        previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]] | None:
-        if self.detect_sheet_type(sheet_name) == "reference":
+        sheet_type = self.detect_sheet_type(sheet_name)
+        if sheet_type == "reference":
             return []
+        if sheet_type == "scenario_details":
+            # One summary row per data set (DS), derived from the upstream
+            # Policy Information, Sched of Locations, PL_Rating, and Sched of
+            # Vehicles sheets that have already been generated.
+            return self._build_scenario_details(unique_headers, previous_sheets_data or {})
         return None
 
     # ------------------------------------------------------------------
@@ -716,6 +811,17 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
                         row[key] = random.choice(VALID_ORG_TYPES)
                 elif kl == "gl (yes/no)":
                     row[key] = "Yes"
+                elif kl == "contact number":
+                    # Rule 1: format as USA 10-digit "XXX XXX XXXX" [DS_044]
+                    row[key] = _format_us_phone(val)
+                elif "producer" in kl and ("phone" in kl or "contact number" in kl):
+                    # Rule 9: format as USA 10-digit "XXX XXX XXXX" [DS_045]
+                    row[key] = _format_us_phone(val)
+                elif kl == "zip code" or kl == "zip":
+                    # Rule 3: 5-digit numeric ZIP (preserve leading zeros)
+                    cleaned = _format_zip5(val)
+                    if cleaned:
+                        row[key] = cleaned
                 elif "effective date" in kl or "expiration date" in kl:
                     # Convert MMDDYYYY (8-digit no-separator) → MM/DD/YYYY [DS_026]
                     if val and len(val) == 8 and val.isdigit():
@@ -763,6 +869,18 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
                     insured = pi_rows[min(insured_idx, len(pi_rows) - 1)]
                     row[tid_key] = insured.get("Test ID", row.get(tid_key, ""))
 
+        # DS_043: renumber the "#" column per insured so each location maps
+        # clearly back to its insured (1, 2, 3 within each Test ID) instead of
+        # a confusing global 1..N running counter.
+        seq_by_tid: dict[str, int] = {}
+        for row in rows:
+            num_key = next((k for k in row if k.strip() == "#"), None)
+            tid_key = next((k for k in row if k.lower() == "test id"), None)
+            if num_key and tid_key:
+                tid = str(row.get(tid_key, ""))
+                seq_by_tid[tid] = seq_by_tid.get(tid, 0) + 1
+                row[num_key] = seq_by_tid[tid]
+
         for row in rows:
             # Rule 13: Class Code must be from approved list
             cc_key = _find_col(row, "class code")
@@ -776,6 +894,13 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
             if state_key:
                 if row[state_key] not in VALID_STATES:
                     row[state_key] = random.choice(VALID_STATES)
+
+            # Rule 10: 5-digit ZIP (preserve leading zeros for CT/NJ)
+            zip_key = _find_col(row, "zip")
+            if zip_key:
+                cleaned = _format_zip5(row.get(zip_key))
+                if cleaned:
+                    row[zip_key] = cleaned
 
         return rows
 
@@ -1049,6 +1174,7 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         """Normalize vehicle types and align garaging state/ZIP to Auto=Yes insureds."""
         # Align each vehicle row to the corresponding Auto=Yes insured
         auto_insureds: list[dict] = []
+        pi_rows: list[dict] = []
         if previous_sheets_data:
             pi_rows = previous_sheets_data.get("Policy Information", [])
             auto_insureds = _get_lob_yes_insureds(pi_rows, "auto")
@@ -1057,7 +1183,20 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         if auto_insureds:
             veh_counts   = _vehicle_counts_for_insureds(auto_insureds)
             row_insured_map = _build_insured_row_map(veh_counts)
+            # DS_050: never carry more vehicle rows than the Auto=Yes insureds
+            # account for. Extra LLM-hallucinated rows would otherwise surface a
+            # populated Vehicle Type for an insured that owns no vehicles.
+            expected_row_count = sum(veh_counts)
+            if len(rows) > expected_row_count:
+                rows = rows[:expected_row_count]
+        elif pi_rows:
+            # Policy Information is known and NO insured has Auto=Yes → there must
+            # be no vehicle rows at all (and so no stray Vehicle Type values).
+            # [Rule 36 / DS_050]
+            return []
         else:
+            # No policy context available (legacy fallback) — can't validate
+            # against insureds, so leave the LLM rows in place.
             row_insured_map = []
 
         for idx, row in enumerate(rows):
@@ -1075,7 +1214,9 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
                 if gs_key:
                     row[gs_key] = insured.get("Rating State", row.get(gs_key, ""))
                 if zip_key:
-                    row[zip_key] = insured.get("ZIP Code", row.get(zip_key, ""))
+                    # Rule 28: 5-digit ZIP (preserve leading zeros for CT/NJ)
+                    raw_zip = insured.get("ZIP Code", row.get(zip_key, ""))
+                    row[zip_key] = _format_zip5(raw_zip) or raw_zip
                 # Stamp Test ID to match the correct Auto=Yes insured
                 tid_key = next((k for k in row if k.lower() == "test id"), None)
                 if tid_key and insured.get("Test ID"):
@@ -1098,6 +1239,41 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
                 flag_key = _find_col(row, *col_fragment)
                 if flag_key and str(row[flag_key]).strip().upper() not in ("Y", "N"):
                     row[flag_key] = random.choice(["Y", "N"])
+
+        # DS_046 / Rule 36: guarantee EVERY Auto=Yes insured has at least 1
+        # vehicle row. If the LLM skipped an insured, synthesize a valid vehicle
+        # row from a template so no Auto=Yes insured is left with zero vehicles.
+        if auto_insureds and rows:
+            def _row_tid(r: dict) -> str:
+                tk = next((k for k in r if k.lower() == "test id"), None)
+                return str(r.get(tk, "")) if tk else ""
+
+            present_tids = {_row_tid(r) for r in rows}
+            template = rows[0]
+            for i, insured in enumerate(auto_insureds, 1):
+                tid = str(insured.get("Test ID", ""))
+                if not tid or tid in present_tids:
+                    continue
+                new_row = dict(template)
+                tid_key = next((k for k in new_row if k.lower() == "test id"), None)
+                if tid_key:
+                    new_row[tid_key] = tid
+                if gs_key := _find_col(new_row, "garaging state"):
+                    new_row[gs_key] = insured.get("Rating State", insured.get("State", ""))
+                if zip_key := _find_col(new_row, "zip code"):
+                    raw_zip = insured.get("ZIP Code", "")
+                    new_row[zip_key] = _format_zip5(raw_zip) or raw_zip
+                if unit_key := _find_col(new_row, "unit"):
+                    new_row[unit_key] = f"{i:02d}A"
+                rows.append(new_row)
+                present_tids.add(tid)
+
+        # Renumber the "#" column sequentially so it stays coherent after any
+        # synthesized rows above.
+        for n, row in enumerate(rows, 1):
+            num_key = next((k for k in row if k.strip() == "#"), None)
+            if num_key:
+                row[num_key] = n
 
         return rows
 
@@ -1139,6 +1315,113 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
                     row[exc_key] = random.choice(["Yes", "No"])
 
         return rows
+
+    # ------------------------------------------------------------------
+    # Test Scenerio Details (deterministic summary, one row per DS)
+    # ------------------------------------------------------------------
+
+    def _build_scenario_details(
+        self,
+        unique_headers: list[str],
+        previous_sheets_data: dict[str, list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Build one summary row per insured (DS) for the Test Scenerio Details sheet.
+
+        Columns (per the client scenario spec):
+        - Scenario ID            → the insured's Test ID (DS-01, DS-02, ...)
+        - State                  → Policy Information "State"
+        - Org Type/Entity        → Policy Information "Org Type / Entity"
+        - Location Count         → # of Sched of Locations rows for the insured
+        - Class Code Count       → # of DISTINCT class codes across those locations
+        - Class of Business Count→ # of DISTINCT Class of Business rows in PL_Rating
+        - Vehicle Count          → # of Sched of Vehicles rows for the insured
+        """
+        pi_rows  = previous_sheets_data.get("Policy Information", []) or []
+        loc_rows = previous_sheets_data.get("Sched of Locations", []) or []
+        pl_rows  = previous_sheets_data.get("PL_Rating", []) or []
+        veh_rows = previous_sheets_data.get("Sched of Vehicles", []) or []
+
+        if not pi_rows:
+            return []
+
+        def _hdr(*frags: str) -> str | None:
+            """First scenario header containing ALL fragments (case-insensitive)."""
+            for h in unique_headers:
+                hl = h.lower()
+                if all(f in hl for f in frags):
+                    return h
+            return None
+
+        sid_key = _hdr("scenario")
+        state_key = _hdr("state")
+        org_key = _hdr("org")
+        loc_count_key = _hdr("location", "count")
+        cc_count_key = _hdr("class code")
+        cob_count_key = _hdr("class of business")
+        veh_count_key = _hdr("vehicle", "count")
+
+        def _tid(row: dict) -> str:
+            tk = next((k for k in row if k.lower() == "test id"), None)
+            return str(row.get(tk, "")).strip() if tk else ""
+
+        # Aggregate per Test ID across the upstream sheets.
+        loc_count: dict[str, int] = {}
+        class_codes: dict[str, set] = {}
+        for row in loc_rows:
+            tid = _tid(row)
+            if not tid:
+                continue
+            loc_count[tid] = loc_count.get(tid, 0) + 1
+            cc_key = _find_col(row, "class code")
+            if cc_key:
+                cc_val = str(row.get(cc_key, "")).strip()
+                if cc_val:
+                    class_codes.setdefault(tid, set()).add(cc_val)
+
+        cob_count: dict[str, set] = {}
+        for row in pl_rows:
+            tid = _tid(row)
+            if not tid:
+                continue
+            cob_key = _find_col(row, "class of business")
+            cob_val = str(row.get(cob_key, "")).strip() if cob_key else ""
+            cob_count.setdefault(tid, set())
+            if cob_val:
+                cob_count[tid].add(cob_val)
+
+        veh_count: dict[str, int] = {}
+        for row in veh_rows:
+            tid = _tid(row)
+            if tid:
+                veh_count[tid] = veh_count.get(tid, 0) + 1
+
+        # Resolve Policy Information state / org-type keys once.
+        pi_state_key = next(
+            (k for k in pi_rows[0] if k.strip().lower() == "state"), None
+        )
+        pi_org_key = next((k for k in pi_rows[0] if "org type" in k.lower()), None)
+
+        scenario_rows: list[dict[str, Any]] = []
+        for pi in pi_rows:
+            tid = _tid(pi)
+            row: dict[str, Any] = {}
+            if sid_key:
+                row[sid_key] = tid
+            if state_key:
+                row[state_key] = pi.get(pi_state_key, "") if pi_state_key else ""
+            if org_key:
+                row[org_key] = pi.get(pi_org_key, "") if pi_org_key else ""
+            if loc_count_key:
+                row[loc_count_key] = loc_count.get(tid, 0)
+            if cc_count_key:
+                row[cc_count_key] = len(class_codes.get(tid, set()))
+            if cob_count_key:
+                row[cob_count_key] = len(cob_count.get(tid, set()))
+            if veh_count_key:
+                row[veh_count_key] = veh_count.get(tid, 0)
+            scenario_rows.append(row)
+
+        return scenario_rows
 
     # ------------------------------------------------------------------
     # Helper

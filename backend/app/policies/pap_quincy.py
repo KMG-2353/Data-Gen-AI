@@ -1704,6 +1704,7 @@ class PapQuincyHandler:
         policy_data: list[dict[str, Any]] | None,
         driver_data: list[dict[str, Any]] | None,
         vehicle_data: list[dict[str, Any]] | None,
+        previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]] | None:
         if detect_sheet_type(sheet_name) != "assignment":
             return None

@@ -32,6 +32,7 @@ app = FastAPI()
 # Configure CORS with environment-aware origins
 _FIXED_ORIGINS = [
     "http://localhost:5173",
+    "http://localhost:5174",
     "https://data-gen-ai-1.onrender.com",
 ]
 
@@ -277,6 +278,7 @@ async def generate_data(request: dict):
                 policy_data=policy_data,
                 driver_data=driver_data,
                 vehicle_data=vehicle_data,
+                previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
             )
 
             if pre_generated is not None:
