@@ -33,6 +33,7 @@ def _parse_date(val: str):
 # delegates the matching post-process fields to them when RULEBOOK_ENABLED.
 from app.rulebook import config as _rb_config
 from app.rulebook import RuleContext, emit_prompt_constraints
+from app.rulebook.scenario import parse_scenarios as _parse_scenarios
 from app.rulebook.profile_rrg import (
     VALID_STATES,
     VALID_ORG_TYPES,
@@ -214,24 +215,83 @@ def _coverage_counts(
     return counts
 
 
-def _vehicle_counts_for_insureds(auto_insureds: list) -> list[int]:
-    """Per-insured vehicle counts spanning the full 1–20 range (DS_033 / DS_048)."""
-    return _coverage_counts(len(auto_insureds), VEHICLE_COUNT_CHECKPOINTS, [2, 1, 3])
+def _specs_from_instruction(special_instruction: str | None):
+    """Parse scenario specs from special instructions, or None when there is no
+    scenario / the rulebook engine is disabled.
+
+    Handlers are singletons, so scenario state must never be stored on the
+    instance — it is parsed locally and threaded through call arguments instead.
+    """
+    if not _rb_config.RULEBOOK_ENABLED:
+        return None
+    return _parse_scenarios(special_instruction).specs or None
 
 
-def _location_counts_for_insureds(policy_data: list) -> list[int]:
-    """Per-insured location counts spanning the full 1–20 range (DS_035 / DS_047)."""
-    return _coverage_counts(len(policy_data), LOCATION_COUNT_CHECKPOINTS, [2, 3, 1])
+def _index_in(full: list, member) -> int | None:
+    """Index of ``member`` within ``full`` by object identity (subset members are
+    the same dict objects filtered from the full insured list)."""
+    for j, candidate in enumerate(full):
+        if candidate is member:
+            return j
+    return None
 
 
-def _cob_counts_for_insureds(pl_insureds: list) -> list[int]:
+def _override_with_specs(subset, full, specs, key, base_counts) -> list[int]:
+    """Prefer the scenario spec count for each insured, falling back to
+    ``base_counts`` (the checkpoint/coverage spread) when no spec specifies it.
+
+    ``subset`` is the LOB-filtered insured list this sheet generates for;
+    ``full`` is the complete insured list the specs are indexed against.
+    """
+    if not specs or full is None:
+        return base_counts
+    out = list(base_counts)
+    for j, member in enumerate(subset):
+        idx = _index_in(full, member)
+        if idx is not None and idx < len(specs):
+            value = specs[idx].get(key)
+            if value is not None:
+                out[j] = value
+    return out
+
+
+def _vehicle_counts_for_insureds(auto_insureds: list, full_insureds=None, specs=None) -> list[int]:
+    """Per-insured vehicle counts spanning the full 1–20 range (DS_033 / DS_048).
+
+    When a scenario supplies a per-insured vehicle count it overrides the
+    coverage spread for that insured (R8/R9); otherwise the checkpoint behavior
+    is unchanged (R10 absence).
+    """
+    base = _coverage_counts(len(auto_insureds), VEHICLE_COUNT_CHECKPOINTS, [2, 1, 3])
+    return _override_with_specs(
+        auto_insureds, full_insureds if full_insureds is not None else auto_insureds,
+        specs, "vehicles", base,
+    )
+
+
+def _location_counts_for_insureds(policy_data: list, specs=None) -> list[int]:
+    """Per-insured location counts spanning the full 1–20 range (DS_035 / DS_047).
+
+    Locations apply to every insured, so the subset is the full insured list and
+    specs align by index directly.
+    """
+    base = _coverage_counts(len(policy_data), LOCATION_COUNT_CHECKPOINTS, [2, 3, 1])
+    return _override_with_specs(policy_data, policy_data, specs, "locations", base)
+
+
+def _cob_counts_for_insureds(pl_insureds: list, full_insureds=None, specs=None) -> list[int]:
     """Per-insured Class of Business counts spanning the full 1–8 range (DS_038 / DS_049).
 
     This ensures some insureds have many CoB rows (up to the rulebook max of 8,
     Rule 38) while others have a single entry, creating realistic variability and
-    full boundary coverage in PL Rating data.
+    full boundary coverage in PL Rating data. A scenario "class codes" count
+    overrides the spread for that insured.
     """
-    return _coverage_counts(len(pl_insureds), COB_COUNT_CHECKPOINTS, [2, 1, 2])
+    base = _coverage_counts(len(pl_insureds), COB_COUNT_CHECKPOINTS, [2, 1, 2])
+    return _override_with_specs(
+        pl_insureds, full_insureds if full_insureds is not None else pl_insureds,
+        specs, "class_of_business", base,
+    )
 
 
 def _unit_suffix(v: int) -> str:
@@ -368,6 +428,9 @@ class RrgHandler:
         special_instruction: str = "",
     ) -> tuple[int, str]:
         sheet_type = self.detect_sheet_type(sheet_name)
+        # Scenario specs (if any) drive per-insured child-row counts. Parsed
+        # locally — never stored on this singleton handler.
+        scenario_specs = _specs_from_instruction(special_instruction)
 
         if sheet_type == "reference":
             return 0, ""
@@ -381,7 +444,9 @@ class RrgHandler:
 
         # ---- Policy Information ----------------------------------------
         if sheet_type == "policy":
-            n = original_row_count
+            # R10: when scenarios are supplied, the number of scenarios sets the
+            # insured count, overriding the row_count field.
+            n = len(scenario_specs) if scenario_specs else original_row_count
 
             # --- LOB Yes/No distribution guidance (DS_042 / DS_033) ---
             # Ensure a realistic mix of Yes and No for each optional LOB.
@@ -448,7 +513,7 @@ RRG POLICY INFORMATION RULES (HARD CONSTRAINTS):
 LOB DISTRIBUTION — each optional LOB MUST have a realistic mix of Yes and No:
 {lob_block}
 """
-            return original_row_count, rules
+            return n, rules
 
         # ---- Schedule of Locations -------------------------------------
         if sheet_type == "locations":
@@ -457,7 +522,7 @@ LOB DISTRIBUTION — each optional LOB MUST have a realistic mix of Yes and No:
             insured_block = ""
             loc_row_count = original_row_count
             if policy_data:
-                counts = _location_counts_for_insureds(policy_data)
+                counts = _location_counts_for_insureds(policy_data, scenario_specs)
                 loc_row_count = sum(counts)
                 lines = []
                 row_num = 1
@@ -539,7 +604,7 @@ RRG GL RATING RULES (HARD CONSTRAINTS):
                 pl_insureds = _get_lob_yes_insureds(policy_data, "pl")
                 if not pl_insureds:
                     return 0, ""
-                cob_counts = _cob_counts_for_insureds(pl_insureds)
+                cob_counts = _cob_counts_for_insureds(pl_insureds, policy_data, scenario_specs)
                 row_count = sum(cob_counts)
                 lines = []
                 row_num = 1
@@ -645,7 +710,7 @@ RRG ABUSE RATING RULES (HARD CONSTRAINTS):
                 if not auto_insureds:
                     return 0, ""
                 # Variable vehicle counts per insured for scenario variability (DS_033)
-                veh_counts = _vehicle_counts_for_insureds(auto_insureds)
+                veh_counts = _vehicle_counts_for_insureds(auto_insureds, policy_data, scenario_specs)
                 row_count  = sum(veh_counts)
                 lines = []
                 row_num = 1
@@ -752,21 +817,24 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         previous_sheets_data: dict[str, list[dict[str, Any]]] | None = None,
     ) -> list[dict[str, Any]]:
         sheet_type = self.detect_sheet_type(sheet_name)
+        # Same scenario specs build_sheet_context used, so post-process row→insured
+        # maps align with the prompted per-insured counts.
+        scenario_specs = _specs_from_instruction(special_instruction)
 
         if sheet_type == "policy":
             rows = self._fix_policy_info(rows)
         elif sheet_type == "locations":
-            rows = self._fix_locations(rows, previous_sheets_data)
+            rows = self._fix_locations(rows, previous_sheets_data, scenario_specs)
         elif sheet_type == "gl_rating":
             rows = self._fix_gl_rating(rows, previous_sheets_data)
         elif sheet_type == "pl_rating":
-            rows = self._fix_pl_rating(rows, previous_sheets_data)
+            rows = self._fix_pl_rating(rows, previous_sheets_data, scenario_specs)
         elif sheet_type == "ebl_rating":
             rows = self._fix_ebl_rating(rows, previous_sheets_data)
         elif sheet_type == "abuse_rating":
             rows = self._fix_abuse_rating(rows, previous_sheets_data)
         elif sheet_type == "vehicles":
-            rows = self._fix_vehicles(rows, previous_sheets_data)
+            rows = self._fix_vehicles(rows, previous_sheets_data, scenario_specs)
         elif sheet_type == "auto_rating":
             rows = self._fix_auto_rating(rows, previous_sheets_data)
 
@@ -861,12 +929,13 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         self,
         rows: list[dict[str, Any]],
         previous_sheets_data: dict | None = None,
+        scenario_specs=None,
     ) -> list[dict[str, Any]]:
         """Validate Class Code, State, and restamp Test IDs for location rows."""
         # Restamp Test IDs using location→insured mapping from Policy Information
         pi_rows = (previous_sheets_data or {}).get("Policy Information", [])
         if pi_rows:
-            loc_counts = _location_counts_for_insureds(pi_rows)
+            loc_counts = _location_counts_for_insureds(pi_rows, scenario_specs)
             row_insured_map = _build_insured_row_map(loc_counts)
             for idx, row in enumerate(rows):
                 tid_key = next((k for k in row if k.lower() == "test id"), None)
@@ -958,6 +1027,7 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         self,
         rows: list[dict[str, Any]],
         previous_sheets_data: dict | None,
+        scenario_specs=None,
     ) -> list[dict[str, Any]]:
         """Enforce Policy Basis consistency, multi-CoB rows, and validate fields.
 
@@ -973,7 +1043,7 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
 
         # Build row→insured mapping using the same CoB count pattern as build_sheet_context
         if pl_insureds:
-            cob_counts = _cob_counts_for_insureds(pl_insureds)
+            cob_counts = _cob_counts_for_insureds(pl_insureds, pi_rows, scenario_specs)
             expected_row_count = sum(cob_counts)
             row_insured_map = _build_insured_row_map(cob_counts)
             # Trim excess rows if LLM generated more than expected
@@ -1176,6 +1246,7 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         self,
         rows: list[dict[str, Any]],
         previous_sheets_data: dict | None = None,
+        scenario_specs=None,
     ) -> list[dict[str, Any]]:
         """Normalize vehicle types and align garaging state/ZIP to Auto=Yes insureds."""
         # Align each vehicle row to the corresponding Auto=Yes insured
@@ -1187,7 +1258,7 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
 
         # Build row→insured mapping using the same variable-count function as build_sheet_context
         if auto_insureds:
-            veh_counts   = _vehicle_counts_for_insureds(auto_insureds)
+            veh_counts   = _vehicle_counts_for_insureds(auto_insureds, pi_rows, scenario_specs)
             row_insured_map = _build_insured_row_map(veh_counts)
             # DS_050: never carry more vehicle rows than the Auto=Yes insureds
             # account for. Extra LLM-hallucinated rows would otherwise surface a
