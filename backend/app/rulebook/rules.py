@@ -54,20 +54,39 @@ class Rule:
 
     ``field_keywords`` is AND-matched against column names. An empty tuple means
     the rule is not bound to a specific column (e.g. a sheet-level CountRule).
+    ``field_match`` is an optional column-name predicate that takes precedence
+    over ``field_keywords`` when the handler's original matching was exact-name
+    or otherwise not a simple substring AND. ``all_columns`` snaps every matching
+    column rather than just the first (mirrors handlers that loop all columns).
     """
 
     id: str
     field_keywords: tuple[str, ...] = ()
     condition: Condition = field(default_factory=always)
     prompt_text: str = ""
+    field_match: Callable[[str], bool] | None = None
+    all_columns: bool = False
 
     def fires(self, ctx: RuleContext) -> bool:
         return self.condition(ctx)
 
+    def _column_matches(self, name: str) -> bool:
+        if self.field_match is not None:
+            return self.field_match(name)
+        if self.field_keywords:
+            nl = name.lower()
+            return all(k.lower() in nl for k in self.field_keywords)
+        return False
+
+    def matching_fields(self, row: dict[str, Any]) -> list[str]:
+        keys = [k for k in row if self._column_matches(k)]
+        if not self.all_columns:
+            return keys[:1]
+        return keys
+
     def find_field(self, row: dict[str, Any]) -> str | None:
-        if not self.field_keywords:
-            return None
-        return find_field(row, self.field_keywords)
+        keys = self.matching_fields(row)
+        return keys[0] if keys else None
 
     def prompt_fragment(self, ctx: RuleContext) -> str:
         """Static fragment by default; subclasses may compute dynamically."""
@@ -78,14 +97,13 @@ class Rule:
         return value
 
     def apply_to_row(self, row: dict[str, Any], ctx: RuleContext) -> dict[str, Any]:
-        """Locate this rule's column in ``row`` and snap its value in place.
+        """Locate this rule's column(s) in ``row`` and snap the value(s) in place.
 
-        No-op when the rule is not column-bound or the column is absent.
+        No-op when the rule is not column-bound or no column matches. Snaps every
+        matching column when ``all_columns`` is set, else only the first.
         """
-        key = self.find_field(row)
-        if key is None:
-            return row
-        row[key] = self.validate(row.get(key), ctx)
+        for key in self.matching_fields(row):
+            row[key] = self.validate(row.get(key), ctx)
         return row
 
 

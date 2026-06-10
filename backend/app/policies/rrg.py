@@ -27,44 +27,23 @@ def _parse_date(val: str):
     return None
 
 
-def _format_zip5(val) -> str | None:
-    """Normalize a ZIP value to a strict 5-digit string (Rules 3 / 10 / 28).
-
-    Strips non-digits, then either left-pads to 5 (preserving leading zeros
-    for CT/NJ ZIPs like 06103, 07102) or trims to 5 if longer. Returns the
-    cleaned string, or None when the input had no digits at all so callers
-    can decide to fall back on the insured's ZIP.
-    """
-    digits = "".join(ch for ch in str(val or "") if ch.isdigit())
-    if not digits:
-        return None
-    if len(digits) < 5:
-        return digits.zfill(5)
-    return digits[:5]
-
-
-def _format_us_phone(val) -> str:
-    """Format a contact/phone value as a USA 10-digit number "XXX XXX XXXX".
-
-    Strips every non-digit character, then groups the digits 3-3-4 separated by
-    single spaces (e.g. 2125550147 → "212 555 0147") per Rule 1 / Rule 9
-    [DS_044 / DS_045]. If the cleaned value is not exactly 10 digits a valid
-    10-digit number is fabricated (area code not starting with 0 or 1) so the
-    output always satisfies the format constraint.
-    """
-    digits = "".join(ch for ch in str(val or "") if ch.isdigit())
-    if len(digits) != 10:
-        digits = str(random.randint(2, 9)) + "".join(
-            str(random.randint(0, 9)) for _ in range(9)
-        )
-    return f"{digits[:3]} {digits[3:6]} {digits[6:]}"
-
-VALID_STATES = ["NY", "AL", "IL", "TX", "FL", "PA", "CT", "NJ"]
-
-VALID_ORG_TYPES = [
-    "Corporation", "Individual", "Joint Venture", "Limited Partnership",
-    "LLC", "Other", "Partnership", "Trust",
-]
+# Canonical RRG value lists and formatters now live in the rulebook (single
+# source of truth) and are imported back here so existing call sites are
+# unchanged. The four extracted rules dual-emit prompt + validator; this handler
+# delegates the matching post-process fields to them when RULEBOOK_ENABLED.
+from app.rulebook import config as _rb_config
+from app.rulebook import RuleContext, emit_prompt_constraints
+from app.rulebook.profile_rrg import (
+    VALID_STATES,
+    VALID_ORG_TYPES,
+    RRG_EXTRACTED_RULES,
+    RRG_CONTACT_RULE,
+    RRG_STATE_RULE,
+    RRG_ZIP_RULE,
+    RRG_ORG_RULE,
+    rrg_format_zip5 as _format_zip5,
+    rrg_format_us_phone as _format_us_phone,
+)
 
 VALID_CLASS_CODES = [
     "10150", "10205", "10257", "10331", "10332", "11039", "11128", "12361",
@@ -437,14 +416,22 @@ class RrgHandler:
 
             lob_block = "\n".join([pl_guidance, ebl_guidance, auto_guidance, abuse_guidance])
 
+            # Contact Number / State / ZIP / Org Type prompt text now comes from
+            # the extracted rules (dual-emit), so prompt + validator can't drift.
+            if _rb_config.RULEBOOK_ENABLED:
+                extracted_block = emit_prompt_constraints(
+                    RRG_EXTRACTED_RULES, sheet_name
+                )
+            else:
+                extracted_block = "\n".join(
+                    r.prompt_text for r in RRG_EXTRACTED_RULES
+                )
+
             rules = f"""
 RRG POLICY INFORMATION RULES (HARD CONSTRAINTS):
 - Test ID: MUST follow the format DS-01, DS-02, DS-03, ... (sequential, zero-padded).
   NEVER use prefixes like PI-, GL-, SL-, or any other format. Always "DS-XX".
-- Contact Number: USA 10-digit phone in "XXX XXX XXXX" format — three groups of 3-3-4 separated by single spaces (e.g. 212 555 0147). No dashes, parentheses, or other special chars [Rule 1 / DS_044]
-- State: MUST be one of {VALID_STATES} [Rule 2]
-- ZIP Code: 5-digit numeric only [Rule 3]
-- Org Type / Entity: MUST be one of {VALID_ORG_TYPES} [Rule 4]
+{extracted_block}
 - State of Operation: MUST be one of {VALID_STATES} [Rule 5]
 - Rating State: MUST be one of {VALID_STATES} [Rule 6]
 - New / Renewal: MUST be "New Business" or "Renewal" [Rule 7]
@@ -796,32 +783,51 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
             if tid_key is not None:
                 row[tid_key] = f"DS-{idx + 1:02d}"
 
+        # State / Org Type / Contact Number / ZIP are delegated to the extracted
+        # rulebook rules (RRG_*_RULE). The handler keeps driving the column-major
+        # loop, so the engine path reproduces the original snap order exactly
+        # (parity). With RULEBOOK_ENABLED off, the inline logic below runs.
+        rb_on = _rb_config.RULEBOOK_ENABLED
+        rctx = RuleContext(sheet="Policy Information", policy_type="RRG")
         for row in rows:
             for key in list(row.keys()):
                 kl = key.lower()
                 val = str(row[key]) if row[key] is not None else ""
                 if kl in ("state", "state of operation", "rating state"):
-                    if val not in VALID_STATES:
+                    if rb_on:
+                        row[key] = RRG_STATE_RULE.validate(val, rctx)
+                    elif val not in VALID_STATES:
                         row[key] = random.choice(VALID_STATES)
                 elif "new" in kl and "renewal" in kl:
                     if val not in VALID_NEW_RENEWAL:
                         row[key] = random.choice(VALID_NEW_RENEWAL)
                 elif "org type" in kl or ("entity" in kl and "org" in kl):
-                    if val not in VALID_ORG_TYPES:
+                    if rb_on:
+                        row[key] = RRG_ORG_RULE.validate(val, rctx)
+                    elif val not in VALID_ORG_TYPES:
                         row[key] = random.choice(VALID_ORG_TYPES)
                 elif kl == "gl (yes/no)":
                     row[key] = "Yes"
                 elif kl == "contact number":
                     # Rule 1: format as USA 10-digit "XXX XXX XXXX" [DS_044]
-                    row[key] = _format_us_phone(val)
+                    row[key] = (
+                        RRG_CONTACT_RULE.validate(val, rctx)
+                        if rb_on
+                        else _format_us_phone(val)
+                    )
                 elif "producer" in kl and ("phone" in kl or "contact number" in kl):
                     # Rule 9: format as USA 10-digit "XXX XXX XXXX" [DS_045]
                     row[key] = _format_us_phone(val)
                 elif kl == "zip code" or kl == "zip":
                     # Rule 3: 5-digit numeric ZIP (preserve leading zeros)
-                    cleaned = _format_zip5(val)
-                    if cleaned:
-                        row[key] = cleaned
+                    if rb_on:
+                        cleaned = RRG_ZIP_RULE.validate(val, rctx)
+                        if cleaned:
+                            row[key] = cleaned
+                    else:
+                        cleaned = _format_zip5(val)
+                        if cleaned:
+                            row[key] = cleaned
                 elif "effective date" in kl or "expiration date" in kl:
                     # Convert MMDDYYYY (8-digit no-separator) → MM/DD/YYYY [DS_026]
                     if val and len(val) == 8 and val.isdigit():
