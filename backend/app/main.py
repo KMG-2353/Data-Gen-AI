@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 
 from app.llm_service import generate_test_data, detect_policy_type, detect_policy_type_from_headers
 from app.policies import get_handler
+from app.rulebook import config as rb_config
+from app.rulebook.profiles import select_profile
+from app.rulebook.scenario import parse_scenarios
 from app.policies.ims import (
     canonical_sheet_name as _ims_canonical_sheet_name,
     extract_lob_flags as _ims_extract_lob_flags,
@@ -209,6 +212,24 @@ async def generate_data(request: dict):
         )
         augmented_special = f"{combo_hint}\n{augmented_special}".strip() if augmented_special else combo_hint
 
+    # Rulebook engine: select the profile (via existing detection) and parse any
+    # scenarios from the special instructions. The handlers self-parse the same
+    # text at their count/validate seams; here we only surface the profile and
+    # any cap adjustments (R11) back to the caller. The whole path is gated by
+    # the RULEBOOK_ENABLED fallback flag.
+    scenario_adjustments: list[str] = []
+    scenario_insured_count = 0
+    if rb_config.RULEBOOK_ENABLED:
+        _scenarios = parse_scenarios(augmented_special)
+        scenario_adjustments = list(_scenarios.adjustments)
+        scenario_insured_count = len(_scenarios.specs)
+        if _scenarios.specs:
+            print(
+                f"[rulebook] profile={select_profile(policy_type).policy_type} "
+                f"scenario_insureds={scenario_insured_count} "
+                f"adjustments={scenario_adjustments}"
+            )
+
     try:
         # PAP: pre-generate Census-verified addresses before any sheet LLM call.
         # The post-processor will overwrite all address fields from this map —
@@ -380,6 +401,8 @@ async def generate_data(request: dict):
             "session_id": session_id,
             "sheets_generated": list(generated_data_by_sheet.keys()),
             "row_count_per_sheet": row_count,
+            "scenario_insured_count": scenario_insured_count,
+            "scenario_adjustments": scenario_adjustments,
             "status": "complete"
         }
     except Exception as e:
