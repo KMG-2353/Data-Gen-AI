@@ -17,6 +17,19 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
+# Canonical IMS Coinsurance / Cause of Loss enums + dual-emit rules now live in
+# the rulebook (single source of truth); imported back so call sites are
+# unchanged. The handler delegates those post-process snaps to the rules when
+# RULEBOOK_ENABLED, proving the engine generalizes beyond RRG.
+from app.rulebook import config as _rb_config
+from app.rulebook import RuleContext
+from app.rulebook.profile_ims import (
+    VALID_COINSURANCE as _VALID_COINSURANCE,
+    VALID_CAUSE_OF_LOSS as _VALID_CAUSE_OF_LOSS,
+    IMS_COINSURANCE_RULE,
+    IMS_CAUSE_OF_LOSS_RULE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Sheet-name canonicalization
@@ -284,9 +297,9 @@ def enforce_effective_expiration_date_range(
 # ---------------------------------------------------------------------------
 
 _VALID_STORIES = ["1", "2", "3"]
-_VALID_COINSURANCE = ["80", "90", "100"]
 _VALID_INFLATION_GUARD = ["2%", "3%", "4%", "6%", "8%", "10%", "N/A"]
-_VALID_CAUSE_OF_LOSS = ["Basic", "Special", "Broad"]
+# _VALID_COINSURANCE and _VALID_CAUSE_OF_LOSS are imported from the rulebook
+# (app.rulebook.profile_ims) — see the module header.
 
 _PROPERTY_EXACT: dict[str, Any] = {
     "Building Ordinance":                "No",
@@ -386,6 +399,8 @@ def _enforce_property_sheet_values(rows: list[dict[str, Any]]) -> list[dict[str,
             except (ValueError, TypeError):
                 row[k] = random.choice(_VALID_STORIES)
 
+        _rb_on = _rb_config.RULEBOOK_ENABLED
+        _rctx = RuleContext(sheet="Property", policy_type="IMS")
         for k in keys:
             if "coinsurance" not in k.lower():
                 continue
@@ -394,7 +409,13 @@ def _enforce_property_sheet_values(rows: list[dict[str, Any]]) -> list[dict[str,
                 continue
             val = str(row[k]).strip()
             if val not in _VALID_COINSURANCE:
-                row[k] = random.choice(_VALID_COINSURANCE)
+                # Delegated to the extracted rule (snap == random.choice), same
+                # column-major order, so parity is exact.
+                row[k] = (
+                    IMS_COINSURANCE_RULE.validate(val, _rctx)
+                    if _rb_on
+                    else random.choice(_VALID_COINSURANCE)
+                )
 
         for k in keys:
             if "inflation guard" not in k.lower():
@@ -414,7 +435,11 @@ def _enforce_property_sheet_values(rows: list[dict[str, Any]]) -> list[dict[str,
                 continue
             val = str(row[k]).strip()
             if val not in _VALID_CAUSE_OF_LOSS:
-                row[k] = random.choice(_VALID_CAUSE_OF_LOSS)
+                row[k] = (
+                    IMS_CAUSE_OF_LOSS_RULE.validate(val, _rctx)
+                    if _rb_on
+                    else random.choice(_VALID_CAUSE_OF_LOSS)
+                )
 
         for k in keys:
             if "tenant improvement" in k.lower():
