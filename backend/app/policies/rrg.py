@@ -12,19 +12,7 @@ Enforces all hard validation rules from the RRG rulebook:
 from __future__ import annotations
 
 import random
-from datetime import datetime
 from typing import Any
-
-
-def _parse_date(val: str):
-    """Parse MM/DD/YYYY or MMDDYYYY into a date object, or return None."""
-    s = str(val or "").strip()
-    for fmt in ("%m/%d/%Y", "%m%d%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    return None
 
 
 # Canonical RRG value lists and formatters now live in the rulebook (single
@@ -34,6 +22,11 @@ def _parse_date(val: str):
 from app.rulebook import config as _rb_config
 from app.rulebook import RuleContext, emit_prompt_constraints
 from app.rulebook.scenario import parse_scenarios as _parse_scenarios
+from app.rulebook.primitives import (
+    parse_date as _parse_date,
+    find_col as _find_col,
+    tid_value as _tid,
+)
 from app.rulebook.profile_rrg import (
     VALID_STATES,
     VALID_ORG_TYPES,
@@ -322,15 +315,6 @@ def _build_insured_row_map(counts: list[int]) -> list[int]:
     for insured_idx, count in enumerate(counts):
         mapping.extend([insured_idx] * count)
     return mapping
-
-
-def _find_col(row: dict, *keywords: str) -> str | None:
-    """Return first key whose lowercase form contains ALL keyword substrings."""
-    for key in row:
-        kl = key.lower()
-        if all(k.lower() in kl for k in keywords):
-            return key
-    return None
 
 
 def _normalize_vehicle_type(value: str) -> str:
@@ -1445,10 +1429,6 @@ RRG AUTO RATING RULES (HARD CONSTRAINTS):
         cc_count_key = _hdr("class code")
         cob_count_key = _hdr("class of business")
         veh_count_key = _hdr("vehicle", "count")
-
-        def _tid(row: dict) -> str:
-            tk = next((k for k in row if k.lower() == "test id"), None)
-            return str(row.get(tk, "")).strip() if tk else ""
 
         # Aggregate per Test ID across the upstream sheets.
         loc_count: dict[str, int] = {}
