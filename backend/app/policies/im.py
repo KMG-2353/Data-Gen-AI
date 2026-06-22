@@ -20,7 +20,7 @@ Scenario ID per Policy Info Test ID, with the real child-row counts).
 from __future__ import annotations
 
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from app.rulebook.primitives import (
