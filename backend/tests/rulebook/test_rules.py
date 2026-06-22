@@ -67,3 +67,13 @@ def test_count_rule_caps_to_max():
     assert rule.cap(25) == (20, True)
     assert rule.cap(8) == (8, False)
     assert rule.cap(0) == (1, False)  # floored to min
+
+
+def test_rule_defaults_to_deterministic():
+    from app.rulebook.rules import Rule
+    assert Rule(id="x").deterministic is True
+
+
+def test_rule_can_be_marked_open():
+    from app.rulebook.rules import Rule
+    assert Rule(id="x", deterministic=False).deterministic is False

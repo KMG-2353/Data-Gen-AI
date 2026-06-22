@@ -66,6 +66,10 @@ class Rule:
     prompt_text: str = ""
     field_match: Callable[[str], bool] | None = None
     all_columns: bool = False
+    # Which side of the determinism boundary this rule's field sits on.
+    # True  -> the engine produces/snaps the value; the LLM is not trusted.
+    # False -> the field is open; the LLM generates within bounds.
+    deterministic: bool = True
 
     def fires(self, ctx: RuleContext) -> bool:
         return self.condition(ctx)

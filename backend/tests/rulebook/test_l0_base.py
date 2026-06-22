@@ -43,3 +43,11 @@ def test_date_and_dollar_are_prompt_only():
     assert rules["l0.dollar"].validate("$1,000", _ctx()) == "$1,000"
     assert rules["l0.date"].prompt_fragment(_ctx())
     assert rules["l0.dollar"].prompt_fragment(_ctx())
+
+
+def test_l0_format_rules_are_deterministic():
+    from app.rulebook.l0_base import l0_by_id
+    by_id = l0_by_id()
+    assert by_id["l0.phone"].deterministic is True
+    assert by_id["l0.zip"].deterministic is True
+    assert by_id["l0.state"].deterministic is True
