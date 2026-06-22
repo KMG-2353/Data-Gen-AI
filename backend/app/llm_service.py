@@ -6,6 +6,11 @@ import random
 import re
 from datetime import date
 from typing import Any
+from app.rulebook.primitives import (
+    format_date_compact as _format_mmddyyyy,
+    add_one_year as _add_one_year,
+    find_header_key as _find_header_key,
+)
 
 def _clean_response_text(text: str) -> str:
     """Normalize common fenced-code formatting around model output."""
@@ -101,27 +106,6 @@ def _include_every_year_requested(special_instruction: str) -> bool:
             "include all years",
         ]
     )
-
-
-def _find_header_key(row: dict[str, Any], candidates: list[str]) -> str | None:
-    """Find a header key by case-insensitive substring match."""
-    for key in row.keys():
-        key_lower = key.lower()
-        if any(candidate in key_lower for candidate in candidates):
-            return key
-    return None
-
-
-def _format_mmddyyyy(value: date) -> str:
-    return value.strftime("%m%d%Y")
-
-
-def _add_one_year(value: date) -> date:
-    try:
-        return value.replace(year=value.year + 1)
-    except ValueError:
-        # Handle Feb 29 -> Feb 28 on non-leap years.
-        return value.replace(month=2, day=28, year=value.year + 1)
 
 
 def _build_date_policy_summary(special_instruction: str) -> str:

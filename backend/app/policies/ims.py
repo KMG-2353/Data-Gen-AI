@@ -29,6 +29,11 @@ from app.rulebook.profile_ims import (
     IMS_COINSURANCE_RULE,
     IMS_CAUSE_OF_LOSS_RULE,
 )
+from app.rulebook.primitives import (
+    format_date_slash as _format_mmddyyyy,
+    add_one_year as _add_one_year,
+    find_header_key as _find_header_key,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -187,25 +192,6 @@ def parse_special_instructions(text: str, row_count: int = 0) -> ParsedInstructi
 # ---------------------------------------------------------------------------
 # Date helpers & enforcement
 # ---------------------------------------------------------------------------
-
-def _format_mmddyyyy(value: date) -> str:
-    return value.strftime("%m/%d/%Y")
-
-
-def _add_one_year(value: date) -> date:
-    try:
-        return value.replace(year=value.year + 1)
-    except ValueError:
-        return value.replace(month=2, day=28, year=value.year + 1)
-
-
-def _find_header_key(row: dict[str, Any], candidates: list[str]) -> str | None:
-    for key in row.keys():
-        key_lower = key.lower()
-        if any(c in key_lower for c in candidates):
-            return key
-    return None
-
 
 def _build_date_policy_summary(pi: ParsedInstructions) -> str:
     if pi.date_range_start is not None:

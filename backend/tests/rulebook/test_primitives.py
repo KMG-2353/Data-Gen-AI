@@ -54,3 +54,13 @@ def test_yes_no_predicates():
     assert is_yes("Yes") and is_yes("y") and is_yes("1")
     assert is_no("No") and is_no("n") and is_no("0")
     assert not is_yes("No") and not is_no("Yes")
+
+
+def test_two_date_paths_use_distinct_named_formats():
+    # Regression guard: the IMS path is slash; the generic path is compact.
+    # If these are ever unified, it must be a deliberate, reviewed change.
+    from app.policies import ims as ims_mod
+    from app import llm_service as llm_mod
+    d = date(2026, 6, 22)
+    assert ims_mod._format_mmddyyyy(d) == "06/22/2026"
+    assert llm_mod._format_mmddyyyy(d) == "06222026"

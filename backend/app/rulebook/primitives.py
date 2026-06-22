@@ -85,3 +85,11 @@ def is_yes(val: Any) -> bool:
 
 def is_no(val: Any) -> bool:
     return str(val or "").strip().lower() in ("no", "n", "false", "0")
+
+
+# NOTE (S1 finding): the two date-enforcement paths historically emitted
+# DIFFERENT formats under the same name `_format_mmddyyyy`:
+#   - app/policies/ims.py        -> format_date_slash   "06/22/2026"
+#   - app/llm_service.py         -> format_date_compact "06222026"
+# This slice preserves both (parity). Which is correct is a QA decision tracked
+# for slice S2 (validation harness) — do not unify without sign-off.
