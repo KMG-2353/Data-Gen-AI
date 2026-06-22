@@ -23,59 +23,15 @@ import random
 from datetime import date, datetime, timedelta
 from typing import Any
 
-
-# ---------------------------------------------------------------------------
-# Small shared helpers
-# ---------------------------------------------------------------------------
-
-def _parse_date(val: Any) -> date | None:
-    """Parse MM/DD/YYYY or MMDDYYYY into a date object, or return None."""
-    s = str(val or "").strip()
-    for fmt in ("%m/%d/%Y", "%m%d%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    return None
-
-
-def _fmt_date(d: date) -> str:
-    return d.strftime("%m/%d/%Y")
-
-
-def _to_number(val: Any) -> float | int | None:
-    """Strip "$", commas and whitespace; return an int/float, or None."""
-    s = str(val or "").strip().replace("$", "").replace(",", "").strip()
-    if not s:
-        return None
-    try:
-        f = float(s)
-    except ValueError:
-        return None
-    return int(f) if f.is_integer() else round(f, 2)
-
-
-def _find_col(row: dict, *keywords: str) -> str | None:
-    """First key whose lowercase form contains ALL keyword substrings."""
-    for key in row:
-        kl = key.lower()
-        if all(k.lower() in kl for k in keywords):
-            return key
-    return None
-
-
-def _tid(row: dict) -> str:
-    """The row's Test ID value (the cross-sheet join key), trimmed."""
-    tk = next((k for k in row if k.lower().strip() == "test id"), None)
-    return str(row.get(tk, "")).strip() if tk else ""
-
-
-def _is_yes(val: Any) -> bool:
-    return str(val or "").strip().lower() in ("yes", "y", "true", "1")
-
-
-def _is_no(val: Any) -> bool:
-    return str(val or "").strip().lower() in ("no", "n", "false", "0")
+from app.rulebook.primitives import (
+    parse_date as _parse_date,
+    format_date_slash as _fmt_date,
+    to_number as _to_number,
+    find_col as _find_col,
+    tid_value as _tid,
+    is_yes as _is_yes,
+    is_no as _is_no,
+)
 
 
 def _get_policy_rows(previous: dict | None) -> list[dict]:
