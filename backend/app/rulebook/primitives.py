@@ -73,6 +73,17 @@ def find_header_key(row: dict, candidates: Sequence[str]) -> str | None:
     return None
 
 
+def default_test_id(index: int, width: int = 3) -> str:
+    """Global default Test ID: ``TS-001`` (1-based, zero-padded to ``width``).
+
+    GLOBAL RULE: Test IDs use the ``TS-`` prefix unless a specific rulebook
+    *explicitly* mandates another (e.g. RRG -> ``DS-``). Handlers without an
+    explicit prefix in their source rulebook MUST route here rather than
+    hardcoding a prefix, so the default stays single-sourced.
+    """
+    return f"TS-{index:0{width}d}"
+
+
 def tid_value(row: dict) -> str:
     """The row's ``Test ID`` value (cross-sheet join key), trimmed."""
     k = next((key for key in row if key.lower().strip() == "test id"), None)
@@ -87,9 +98,11 @@ def is_no(val: Any) -> bool:
     return str(val or "").strip().lower() in ("no", "n", "false", "0")
 
 
-# NOTE (S1 finding): the two date-enforcement paths historically emitted
-# DIFFERENT formats under the same name `_format_mmddyyyy`:
+# NOTE (S1 finding, RESOLVED in S2): the two date-enforcement paths historically
+# emitted DIFFERENT formats under the same name `_format_mmddyyyy`:
 #   - app/policies/ims.py        -> format_date_slash   "06/22/2026"
-#   - app/llm_service.py         -> format_date_compact "06222026"
-# This slice preserves both (parity). Which is correct is a QA decision tracked
-# for slice S2 (validation harness) — do not unify without sign-off.
+#   - app/llm_service.py         -> format_date_compact "06222026"  (the bug)
+# The compact path shipped Effective/Expiration as "07272026" (DF-IM-001 sibling).
+# S2 decision (QA sign-off): UNIFIED to MM/DD/YYYY everywhere — llm_service now
+# imports format_date_slash. format_date_compact is retained only for parsing
+# legacy/compact input via parse_date; no app code emits it.

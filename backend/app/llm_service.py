@@ -7,7 +7,10 @@ import re
 from datetime import date
 from typing import Any
 from app.rulebook.primitives import (
-    format_date_compact as _format_mmddyyyy,
+    # S2 decision: effective/expiration/endorsement dates emit MM/DD/YYYY across
+    # all templates (was format_date_compact "06222026"; unified to slash per QA
+    # sign-off — see DF-IM-001 sibling: eff/exp shipped as "07272026").
+    format_date_slash as _format_mmddyyyy,
     add_one_year as _add_one_year,
     find_header_key as _find_header_key,
 )

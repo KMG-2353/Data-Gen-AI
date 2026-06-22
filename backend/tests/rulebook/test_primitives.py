@@ -3,7 +3,14 @@ from datetime import date
 from app.rulebook.primitives import (
     parse_date, format_date_slash, format_date_compact, add_one_year,
     to_number, find_col, find_header_key, tid_value, is_yes, is_no,
+    default_test_id,
 )
+
+
+def test_default_test_id_is_ts_zero_padded():
+    assert default_test_id(1) == "TS-001"
+    assert default_test_id(12) == "TS-012"
+    assert default_test_id(1, width=2) == "TS-01"
 
 
 def test_parse_date_accepts_slash_compact_and_iso():
@@ -56,11 +63,13 @@ def test_yes_no_predicates():
     assert not is_yes("No") and not is_no("Yes")
 
 
-def test_two_date_paths_use_distinct_named_formats():
-    # Regression guard: the IMS path is slash; the generic path is compact.
-    # If these are ever unified, it must be a deliberate, reviewed change.
+def test_date_paths_unified_to_slash():
+    # S2 decision (QA sign-off): both the IMS handler path and the generic
+    # llm_service path emit MM/DD/YYYY. Previously the generic path emitted
+    # compact "06222026", which shipped Effective/Expiration as "07272026"
+    # (DF-IM-001 sibling). Guard against silent regression to compact.
     from app.policies import ims as ims_mod
     from app import llm_service as llm_mod
     d = date(2026, 6, 22)
     assert ims_mod._format_mmddyyyy(d) == "06/22/2026"
-    assert llm_mod._format_mmddyyyy(d) == "06222026"
+    assert llm_mod._format_mmddyyyy(d) == "06/22/2026"

@@ -72,6 +72,16 @@ def test_valid_quote_date_preserved(handler):
     assert out[0]["Date of Quote"] == "05/20/2026"
 
 
+def test_test_ids_stamped_with_global_ts_prefix(handler):
+    # GLOBAL RULE: Test IDs default to TS-### (no rulebook mandates PI for IM).
+    rows = [
+        {"Test ID": "PI-004", "Effective Date": "05/27/2026", "Type of Entity": "LLC"},
+        {"Test ID": "whatever", "Effective Date": "05/22/2026", "Type of Entity": "LLC"},
+    ]
+    out = handler.post_process(rows, "Policy Info", "")
+    assert [r["Test ID"] for r in out] == ["TS-001", "TS-002"]
+
+
 # ---------------------------------------------------------------------------
 # DF-IM-003 / DF-IM-004 — no equipment when Scheduled Equipment Coverage = No
 # ---------------------------------------------------------------------------

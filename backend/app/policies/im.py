@@ -29,6 +29,7 @@ from app.rulebook.primitives import (
     to_number as _to_number,
     find_col as _find_col,
     tid_value as _tid,
+    default_test_id as _default_tid,
     is_yes as _is_yes,
     is_no as _is_no,
 )
@@ -89,7 +90,7 @@ class ImHandler:
         if sheet_type == "policy":
             rules = """
 SPG INLAND MARINE — POLICY INFO RULES (HARD CONSTRAINTS):
-- Test ID: MUST follow the format PI-001, PI-002, PI-003, ... (sequential, zero-padded to 3 digits).
+- Test ID: MUST follow the format TS-001, TS-002, TS-003, ... (sequential, zero-padded to 3 digits).
 - Binding State / Agency State / Mailing State / Coverage State: MUST be one of VA, MD, DC, PA, NC, WV, DE. All states within a record must be consistent. [Rule 1/19/29/34]
 - Effective Date: MM/DD/YYYY; MUST be on or before Expiration Date. [Rule 4]
 - Expiration Date: MM/DD/YYYY; later than Effective Date (typically Effective + Policy Term). [Rule 5]
@@ -104,7 +105,7 @@ SPG INLAND MARINE — POLICY INFO RULES (HARD CONSTRAINTS):
         if sheet_type == "equipment":
             rules = """
 SPG INLAND MARINE — EQUIPMENT SCHEDULE RULES (HARD CONSTRAINTS):
-- Test ID: reuse the SAME PI-### IDs from Policy Info. Generate equipment ONLY for insureds whose "Scheduled Equipment Coverage" = Yes. [Rule 46]
+- Test ID: reuse the SAME TS-### IDs from Policy Info. Generate equipment ONLY for insureds whose "Scheduled Equipment Coverage" = Yes. [Rule 46]
 - Value ($): a PLAIN NUMBER greater than 25000 and not exceeding 50000 (e.g. 38500). NO "$", NO commas, NO quotes. [Rule 50]
 - Serial Number: unique alphanumeric per item. [Rule 49]
 - Used for Logging?: "Yes" or "No". [Rule 51]
@@ -116,7 +117,7 @@ SPG INLAND MARINE — EQUIPMENT SCHEDULE RULES (HARD CONSTRAINTS):
         if sheet_type == "misc_articles":
             rules = """
 SPG INLAND MARINE — MISC ARTICLES SCHEDULE RULES (HARD CONSTRAINTS):
-- Test ID: reuse the SAME PI-### IDs from Policy Info.
+- Test ID: reuse the SAME TS-### IDs from Policy Info.
 - Miscellaneous Articles Coverage Selected?: "Yes" or "No". [Rule 59]
 - Total Value of Miscellaneous Articles ($): when coverage = Yes, a PLAIN NUMBER greater than 0 and not exceeding 10000 (e.g. 4850). NO "$", NO commas, NO quotes. When coverage = No, leave BLANK. [Rule 60]
 """
@@ -137,7 +138,7 @@ SPG INLAND MARINE — MISC ARTICLES SCHEDULE RULES (HARD CONSTRAINTS):
                 )
             rules = f"""
 SPG INLAND MARINE — LOSS HISTORY RULES (HARD CONSTRAINTS):
-- Test ID: reuse the SAME PI-### IDs from Policy Info.
+- Test ID: reuse the SAME TS-### IDs from Policy Info.
 - Any Losses in Past 3 Years?: "Yes" or "No". If "No", leave all loss fields (#, Loss Date, Type of Loss, Details, Amount) blank for that Test ID. [Rule 61]
 - Loss Date: MM/DD/YYYY; MUST be within the 3 years immediately before the insured's Effective Date AND earlier than the Effective Date. [Rule 64]
 - Type of Loss: one of Fire, Water Damage - Weather Related, Water Damage - Non-weather Related, Wind Damage, Hail Damage, Theft, Physical Damage - All Other, Liability. [Rule 65]
@@ -149,7 +150,7 @@ SPG INLAND MARINE — LOSS HISTORY RULES (HARD CONSTRAINTS):
         if sheet_type == "additional_interests":
             rules = """
 SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
-- Test ID: reuse the SAME PI-### IDs from Policy Info.
+- Test ID: reuse the SAME TS-### IDs from Policy Info.
 - Any Loss Payees on Scheduled Equipment?: "Yes" or "No". If "No", leave all Loss Payee fields blank. [Rule 69]
 - State: one of VA, MD, DC, PA, NC, WV, DE, AL. [Rule 75]
 - For Equipment #: must reference an existing Scheduled Equipment item number. [Rule 77]
@@ -213,7 +214,7 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
         for idx, row in enumerate(rows):
             tid_key = next((k for k in row if k.lower().strip() == "test id"), None)
             if tid_key is not None:
-                row[tid_key] = f"PI-{idx + 1:03d}"
+                row[tid_key] = _default_tid(idx + 1)
 
             eff_key = _find_col(row, "effective date")
             quote_key = _find_col(row, "date of quote")
