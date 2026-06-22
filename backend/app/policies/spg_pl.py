@@ -16,65 +16,27 @@ deterministically as a per-scenario summary of the real child-row counts.
 from __future__ import annotations
 
 import random
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from app.rulebook.l0_base import format_test_case_id, format_zip5
+from app.rulebook.primitives import (
+    parse_date as _parse_date,
+    format_date_slash as _fmt_date,
+    to_number as _to_number,
+    find_col as _find_col,
+    tid_value as _tid,
+    is_yes as _is_yes,
+    is_no as _is_no,
+)
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers (mirror app/policies/im.py)
+# Shared helpers (handler-specific; not in primitives)
 # ---------------------------------------------------------------------------
-
-def _parse_date(val: Any) -> date | None:
-    s = str(val or "").strip()
-    for fmt in ("%m/%d/%Y", "%m%d%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    return None
-
-
-def _fmt_date(d: date) -> str:
-    return d.strftime("%m/%d/%Y")
-
-
-def _to_number(val: Any) -> float | int | None:
-    s = str(val or "").strip().replace("$", "").replace(",", "").strip()
-    if not s:
-        return None
-    try:
-        f = float(s)
-    except ValueError:
-        return None
-    return int(f) if f.is_integer() else round(f, 2)
-
-
-def _find_col(row: dict, *keywords: str) -> str | None:
-    """First key whose lowercase form contains ALL keyword substrings."""
-    for key in row:
-        kl = key.lower()
-        if all(k.lower() in kl for k in keywords):
-            return key
-    return None
-
 
 def _tid_key(row: dict) -> str | None:
     return next((k for k in row if k.lower().strip() == "test id"), None)
-
-
-def _tid(row: dict) -> str:
-    k = _tid_key(row)
-    return str(row.get(k, "")).strip() if k else ""
-
-
-def _is_yes(val: Any) -> bool:
-    return str(val or "").strip().lower() in ("yes", "y", "true", "1")
-
-
-def _is_no(val: Any) -> bool:
-    return str(val or "").strip().lower() in ("no", "n", "false", "0")
 
 
 def _blank_fields(row: dict, *fragments: str) -> None:
