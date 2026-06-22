@@ -4,3 +4,9 @@ CLAUDE.md
 *.docx
 *.md
 *.pptx
+.obsidian
+
+
+
+# Ignore Smart Environment folder
+.smart-env

@@ -36,7 +36,7 @@ def test_rrg_with_scenario_drives_cross_sheet_counts():
     n_policy, _ = handler.build_sheet_context(
         "Policy Information", None, None, original_row_count=10, special_instruction=si,
     )
-    assert n_policy == 1  # scenario overrides row_count
+    assert n_policy == 10  # UI count wins; scenario is a per-insured template
     insureds = [{"Named Insured": "A", "Auto (Yes/No)": "Yes", "State": "NY",
                  "Rating State": "NY", "ZIP Code": "10004"}]
     from app.rulebook.scenario import parse_scenarios

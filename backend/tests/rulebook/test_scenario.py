@@ -55,3 +55,29 @@ def test_n_insureds_replicates_spec():
 def test_class_of_business_phrase_not_shadowed_by_class_code():
     result = parse_scenarios("1 insured: 4 class of business")
     assert result.specs[0].counts == {"class_of_business": 4}
+
+
+def test_word_number_and_plural_class_phrasing():
+    # The natural phrasing users actually type: spelled-out "One" and the
+    # plural "classes of business" must both parse (regression for the
+    # silent-empty bug that fell back to default output).
+    result = parse_scenarios(
+        "One insured with 20 vehicles, 20 locations, and 8 classes of business"
+    )
+    assert len(result) == 1
+    assert result.specs[0].counts == {
+        "vehicles": 20,
+        "locations": 20,
+        "class_of_business": 8,
+    }
+
+
+def test_word_numbers_a_an_single_mean_one():
+    for phrasing in ("a insured: 3 vehicles", "an insured: 3 vehicles",
+                     "single insured: 3 vehicles"):
+        assert len(parse_scenarios(phrasing)) == 1
+
+
+def test_word_number_extra_insured_not_miscounted():
+    # "extra insured" must not match the "a" word-number branch.
+    assert len(parse_scenarios("extra insured language, 3 vehicles")) == 0

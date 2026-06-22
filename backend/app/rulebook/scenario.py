@@ -25,9 +25,10 @@ COUNT_MAXIMA: dict[str, int] = {
 
 # unit phrase -> canonical count key. Order matters: longer/more-specific
 # phrases first so "class of business" is not shadowed by a "class" prefix.
+# ``class(?:es)?`` accepts the plural "classes of business" users naturally type.
 _UNIT_PATTERNS: list[tuple[str, str]] = [
-    (r"class\s+of\s+business(?:es)?", "class_of_business"),
-    (r"class\s+codes?", "class_of_business"),
+    (r"class(?:es)?\s+of\s+business(?:es)?", "class_of_business"),
+    (r"class(?:es)?\s+codes?", "class_of_business"),
     (r"\bcob\b", "class_of_business"),
     (r"vehicles?", "vehicles"),
     (r"locations?", "locations"),
@@ -38,7 +39,30 @@ _COUNT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_INSURED_RE = re.compile(r"(\d+)\s*insureds?\b", re.IGNORECASE)
+# Spelled-out insured counts users type instead of digits ("One insured ...").
+# "a" / "an" / "single" all mean one.
+_WORD_NUMBERS: dict[str, int] = {
+    "a": 1, "an": 1, "single": 1,
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+    "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+}
+
+# The insured count may be a digit or a spelled-out word. A leading \b stops "a"
+# from matching the tail of words like "extra insured".
+_INSURED_RE = re.compile(
+    r"\b(\d+|" + "|".join(_WORD_NUMBERS) + r")\s*insureds?\b",
+    re.IGNORECASE,
+)
+
+
+def _to_count(token: str) -> int:
+    """Digit string or spelled-out number word -> int (min 1)."""
+    token = token.strip().lower()
+    if token.isdigit():
+        return max(1, int(token))
+    return _WORD_NUMBERS.get(token, 1)
 
 
 def _canonical_unit(raw: str) -> str:
@@ -110,7 +134,7 @@ def parse_scenarios(text: str | None) -> ScenarioParseResult:
         counts = _parse_counts(body, result.adjustments)
         if not counts:
             continue
-        n_insureds = max(1, int(match.group(1)))
+        n_insureds = _to_count(match.group(1))
         for _ in range(n_insureds):
             result.specs.append(InsuredSpec(counts=dict(counts)))
 

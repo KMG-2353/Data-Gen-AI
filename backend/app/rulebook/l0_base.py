@@ -60,6 +60,16 @@ def format_ssn(value):
     return value
 
 
+# Default test-case-id convention. When a rater template carries a test-case /
+# scenario id column but defines no convention of its own, ids are stamped
+# sequentially as ``TS-01, TS-02, …`` — the same convention IMS uses. Raters
+# inherit this as their default (handlers import this helper so the L0 base rule
+# stays the single source of the format).
+def format_test_case_id(index: int) -> str:
+    """1-based row index -> default ``TS-01`` test-case id (zero-padded to 2)."""
+    return f"TS-{int(index):02d}"
+
+
 # --- L0 rule definitions -----------------------------------------------------
 
 def l0_rules() -> list[Rule]:
@@ -104,6 +114,21 @@ def l0_rules() -> list[Rule]:
             prompt_text=(
                 "- Effective/Expiration dates: consistent format across sheets; "
                 "expiration exactly 1 year after effective."
+            ),
+        ),
+        # Default test-case-id convention: when a template defines no convention
+        # of its own, the test-case / scenario id column uses sequential TS-01,
+        # TS-02, … (the IMS convention). Deterministic per-row stamping happens in
+        # the handlers (which import ``format_test_case_id``) because it needs the
+        # row index; this base rule carries the prompt guidance.
+        Rule(
+            id="l0.test_case_id",
+            field_keywords=(),
+            prompt_text=(
+                "- Test ID / Test Case No / Scenario ID: when no other convention "
+                "is specified, use sequential TS-01, TS-02, TS-03 … (zero-padded). "
+                "Keep the SAME id across every sheet describing the same "
+                "scenario/insured."
             ),
         ),
     ]

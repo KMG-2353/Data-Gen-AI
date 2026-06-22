@@ -246,12 +246,19 @@ def _override_with_specs(subset, full, specs, key, base_counts) -> list[int]:
     if not specs or full is None:
         return base_counts
     out = list(base_counts)
+    # A single spec is a per-insured template: broadcast it to every insured so
+    # all N test cases (N from the UI) share the same vehicle/location/CoB combo.
+    # Multiple specs distribute by insured index; insureds past the last spec
+    # keep the coverage spread.
+    broadcast = len(specs) == 1
     for j, member in enumerate(subset):
-        idx = _index_in(full, member)
-        if idx is not None and idx < len(specs):
-            value = specs[idx].get(key)
-            if value is not None:
-                out[j] = value
+        if broadcast:
+            value = specs[0].get(key)
+        else:
+            idx = _index_in(full, member)
+            value = specs[idx].get(key) if (idx is not None and idx < len(specs)) else None
+        if value is not None:
+            out[j] = value
     return out
 
 
@@ -444,9 +451,11 @@ class RrgHandler:
 
         # ---- Policy Information ----------------------------------------
         if sheet_type == "policy":
-            # R10: when scenarios are supplied, the number of scenarios sets the
-            # insured count, overriding the row_count field.
-            n = len(scenario_specs) if scenario_specs else original_row_count
+            # The UI test-case count is the single source of truth for the number
+            # of insureds. A scenario is a per-insured template (counts of
+            # vehicles/locations/CoB per insured), not an insured count, so it
+            # never shrinks or overrides original_row_count.
+            n = original_row_count
 
             # --- LOB Yes/No distribution guidance (DS_042 / DS_033) ---
             # Ensure a realistic mix of Yes and No for each optional LOB.

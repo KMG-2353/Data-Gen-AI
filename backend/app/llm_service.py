@@ -288,6 +288,15 @@ def detect_policy_type(filename: str) -> str:
         return "PAP"
     if name.startswith("MCA"):
         return "MCA"
+    # SPG Inland Marine rater (filename like "SPG_IM_Rater_...").
+    if name.startswith("SPG_IM") or "IM_RATER" in name:
+        return "IM"
+    # SPG Personal Lines raters. DW checked first so the combined HO_DW template
+    # (which carries DF sheets too) routes to the Dwelling Fire handler.
+    if "_DW" in name:
+        return "DW"
+    if "_HO" in name:
+        return "HO"
     return "GENERIC"
 
 
@@ -344,6 +353,23 @@ def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
     rrg_spaced_hits = sum(1 for kw in rrg_spaced if any(kw in s for s in sheets_lower))
     if rrg_spaced_hits >= 2:
         return "RRG"
+
+    # IM (SPG Inland Marine rater): distinctive Equipment Schedule + Misc
+    # Articles + Loss History sheet combination, or the Scheduled Equipment
+    # Coverage policy header. Checked before GENERIC; IMS/RRG never match these.
+    has_equipment = any("equipment schedule" in s for s in sheets_lower)
+    has_misc_articles = any("misc articles" in s or "miscellaneous articles" in s for s in sheets_lower)
+    has_sched_equip_header = any("scheduled equipment coverage" in h for h in all_headers_lower)
+    if (has_equipment and has_misc_articles) or has_sched_equip_header:
+        return "IM"
+
+    # SPG Personal Lines raters. Distinguished by their LOB-prefixed sheets:
+    #   DW → "DF Policy" / "DF Locations";  HO → "HO Dwelling" / "HO Policy".
+    # DW is checked first so a combined HO+DW workbook routes to the DW handler.
+    if any("df policy" in s or "df location" in s for s in sheets_lower):
+        return "DW"
+    if any("ho dwelling" in s or "ho policy" in s for s in sheets_lower):
+        return "HO"
 
     return "GENERIC"
 

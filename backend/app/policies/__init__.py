@@ -15,6 +15,8 @@ from .generic import GenericHandler
 from .pap_quincy import PapQuincyHandler
 from .ims import ImsHandler
 from .rrg import RrgHandler
+from .im import ImHandler
+from .spg_pl import DwHandler, HoHandler
 
 
 _HANDLERS: dict[str, PolicyHandler] = {
@@ -22,6 +24,9 @@ _HANDLERS: dict[str, PolicyHandler] = {
     "PAP": PapQuincyHandler(),
     "IMS": ImsHandler(),
     "RRG": RrgHandler(),
+    "IM": ImHandler(),
+    "DW": DwHandler(),
+    "HO": HoHandler(),
 }
 
 
