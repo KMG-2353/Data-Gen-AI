@@ -28,7 +28,43 @@ from app.rulebook.primitives import (
     tid_value as _tid,
     is_yes as _is_yes,
     is_no as _is_no,
+    format_us_phone as _fmt_phone,
+    coerce_to_allowed as _coerce,
 )
+
+# ---------------------------------------------------------------------------
+# Approved dropdown values — sourced verbatim from the rater template's
+# "15_LKP_Dropdowns" sheet (SPG_PL_HO_DW_Rater). These are ruleset data, not
+# magic strings: each list is the literal set of cells the template allows.
+# ---------------------------------------------------------------------------
+
+# Previous Wind/Hail Deductible (LKP "WH Ded"): codes 0-5, never dollar amounts.
+_WIND_HAIL_DEDUCTIBLES = ("0", "1", "2", "3", "4", "5")
+
+# Reason for Termination (LKP "Term Rsn"): a MANDATORY dropdown whose first
+# option covers the not-terminated case — so this field is never blank when
+# prior insurance exists.
+_TERM_REASON_NONE = "Coverage Has Never Been Cancelled or Terminated"
+_TERM_REASON_DEFAULT = "Nonpayment of Premium"
+
+# Siding (LKP "Siding") — full dropdown; "Brick" is intentionally NOT a member.
+_DW_SIDING = ("Aluminum", "Asbestos", "Cement Fiber", "EIFS", "Fiberglass",
+              "Hardboard Composite", "Masonry", "Stucco", "Vinyl", "Wood")
+# HO eligibility (Rule 104) excludes Hardboard Composite, EIFS, Asbestos.
+_HO_SIDING = ("Aluminum", "Cement Fiber", "Fiberglass", "Masonry",
+              "Stucco", "Vinyl", "Wood")
+_SIDING_DEFAULT = "Vinyl"
+
+# Roofing (LKP "Roofing") — HO eligibility (Rule 103) excludes Slate,
+# Wood Shake, Rubberized Membrane, leaving Asphalt Shingle / Metal.
+_HO_ROOFING = ("Asphalt Shingle", "Metal")
+_HO_ROOFING_DEFAULT = "Asphalt Shingle"
+
+# Child-schedule record caps per scenario (ruleset: 1-10 payees/losses,
+# up to 20 locations per insured).
+_MAX_LOSS_PAYEES = 10
+_MAX_LOSS_HISTORY = 10
+_MAX_LOCATIONS = 20
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +98,10 @@ def _normalize_common(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             if "zip" in kl:
                 row[key] = format_zip5(val)
+            elif "phone" in kl or "fax" in kl:
+                # Rule: phone/fax/insured numbers must be U.S.-formatted
+                # (DEF-006, HO-003/004/005). Only non-blank cells reach here.
+                row[key] = _fmt_phone(val)
             elif "date" in kl or "dob" in kl:
                 d = _parse_date(val)
                 if d is not None:
@@ -101,6 +141,10 @@ class _SpgPersonalLinesHandler:
     # Subclasses override these sheet-name fragments.
     _property_frags: tuple[str, ...] = ()       # DF Locations / HO Dwelling
     _product_default = "Dwelling Fire DP-3"
+    # DW caps locations per insured; HO Dwelling is single-row so stays None.
+    _property_max: int | None = None
+    # HO must always report "No" for Any Open Claims?; DW leaves it as generated.
+    _force_open_claims_no = False
 
     # ------------------------------------------------------------------
     # Sheet type detection
@@ -158,8 +202,9 @@ class _SpgPersonalLinesHandler:
 SPG PERSONAL LINES — POLICY INFO RULES (HARD CONSTRAINTS):
 {tid_rule}
 - Binding State: one of {', '.join(_BINDING_STATES)}. [Rule 1]
-- Product Selected: one of {', '.join(_PRODUCTS)}. [Rule 2]
-- Effective Date / Expiration Date / Quote Date: MM/DD/YYYY. Expiration = Effective + 1 year. Quote Date <= Effective Date. [Rule 4/5]
+- Product Selected: MUST be "{self._product_default}" — no other value is permitted. [Rule 2]
+- Effective Date / Expiration Date: MM/DD/YYYY. Expiration = Effective + 1 year. [Rule 4/5]
+- Quote Date: today's date (the date the data is created); never a past or future date. MM/DD/YYYY.
 - Agent Commission: one of 10%,10.5%,…,20%. If Binding State = PA, Agent Commission MUST be 10%. [Rule 21]
 - Type of Entity: one of Individual, Corporation, LLC, Partnership, Joint Venture, Estate, Trust. [Rule 23]
 - Date of Birth: an adult (18-100), never in the future. [Rule 28]
@@ -184,7 +229,7 @@ SPG PERSONAL LINES — LOSS PAYEES RULES (HARD CONSTRAINTS):
 {reuse_rule}
 - Generate realistic lender / bank / mortgage company names. State is a 2-letter code consistent with City/ZIP.
 - Is Mortgagee?: Yes/No. If No, leave Loan Number and Mortgage Current? BLANK. If Yes, both MUST be populated (Loan Number = unique alphanumeric). [Rule 119/120/121]
-- Generate 0-2 loss-payee rows per scenario; leave the sheet empty for scenarios with no mortgagee.
+- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss-payee rows per scenario. [Rule 119]
 """
             return original_row_count, rules
 
@@ -199,7 +244,7 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
 - Loss Date: MM/DD/YYYY, within the 5 years before the Effective Date AND earlier than it. [Rule 148/126]
 - Type of Loss: one of Fire, Water Damage – Weather Related, Water Damage – Non-Weather Related, Wind Damage, Hail Damage, Theft, Physical Damage – All Other, Liability. [Rule 149/127]
 - Amount ($): a PLAIN positive number > 0 (no $, no commas). [Rule 151/129]
-- For scenarios WITH losses generate 1-3 loss rows; otherwise a single blank-loss row.
+- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss rows per scenario (one row per loss). For no-loss scenarios use a single blank-loss row. [Rule 145/123]
 {eff_hint}
 """
             return original_row_count, rules
@@ -266,14 +311,35 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
         if st == "uw_history":
             rows = self._fix_uw_history(rows)
         elif st == "property":
+            if self._property_max:
+                rows = self._cap_per_tid(rows, self._property_max)
             rows = self._fix_property(rows)
         elif st == "coverages":
             rows = self._fix_coverages(rows)
         elif st == "loss_payees":
+            rows = self._cap_per_tid(rows, _MAX_LOSS_PAYEES)
             rows = self._fix_loss_payees(rows)
         elif st == "loss_history":
+            rows = self._cap_per_tid(rows, _MAX_LOSS_HISTORY)
             rows = self._fix_loss_history(rows, previous_sheets_data)
         return _normalize_common(rows)
+
+    def _cap_per_tid(self, rows: list[dict[str, Any]], max_n: int) -> list[dict[str, Any]]:
+        """Keep at most ``max_n`` child rows per Test ID (ruleset upper bound).
+
+        The lower bound (>= 1 record) and "generate multiple" behaviour are
+        driven by the per-sheet generation prompt; this deterministic pass only
+        enforces the maximum the LLM can over-produce. [DEF-007/009/010,
+        HO-010/012]
+        """
+        seen: dict[str, int] = {}
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            tid = _tid(row)
+            seen[tid] = seen.get(tid, 0) + 1
+            if seen[tid] <= max_n:
+                out.append(row)
+        return out
 
     # ------------------------------------------------------------------
     # Test ID handling
@@ -286,21 +352,28 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             if tk is not None:
                 row[tk] = format_test_case_id(idx + 1)
 
-            # Expiration = Effective + 1 year; Quote Date <= Effective.
+            # Product Selected is pinned per LOB: DW -> "Dwelling Fire DP-3",
+            # HO -> "HO-3 Homeowners". No other dropdown value is permitted.
+            # [DEF-001 / HO-001, Rule 2]
+            prod_key = _find_col(row, "product selected")
+            if prod_key:
+                row[prod_key] = self._product_default
+
+            # Expiration = Effective + 1 year. [Rule 4/5]
             eff_key = _find_col(row, "effective date")
             exp_key = _find_col(row, "expiration date")
             quote_key = _find_col(row, "quote date")
             eff = _parse_date(row.get(eff_key)) if eff_key else None
-            if eff:
-                if exp_key:
-                    try:
-                        row[exp_key] = _fmt_date(eff.replace(year=eff.year + 1))
-                    except ValueError:  # Feb 29
-                        row[exp_key] = _fmt_date(eff + timedelta(days=365))
-                if quote_key:
-                    q = _parse_date(row.get(quote_key))
-                    if q is None or q > eff:
-                        row[quote_key] = _fmt_date(eff - timedelta(days=random.randint(1, 14)))
+            if eff and exp_key:
+                try:
+                    row[exp_key] = _fmt_date(eff.replace(year=eff.year + 1))
+                except ValueError:  # Feb 29
+                    row[exp_key] = _fmt_date(eff + timedelta(days=365))
+
+            # Quote Date must be the data-creation date (today): never a past or
+            # future date. [DEF-002 / HO-002]
+            if quote_key:
+                row[quote_key] = _fmt_date(date.today())
 
             # Rule 21: PA binding state forces 10% commission.
             bind_key = _find_col(row, "binding state")
@@ -358,11 +431,28 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
                     "previous wind/hail",
                 )
 
-            # Reason for Termination only when terminated at company request.
+            # Reason for Termination is a MANDATORY dropdown whenever prior
+            # insurance exists: terminated -> a real reason; not terminated ->
+            # the "never cancelled/terminated" option. Only the prior-insurance =
+            # No case (blanked above) leaves it empty. [DEF-004, Rule 59/63]
             term_key = _find_col(row, "terminated at company")
             reason_key = _find_col(row, "reason for termination")
-            if term_key and reason_key and not _is_yes(row.get(term_key)):
-                row[reason_key] = ""
+            prior_present = bool(prior_key) and not _is_no(row.get(prior_key))
+            if reason_key and prior_present:
+                if term_key and _is_yes(row.get(term_key)):
+                    cur = str(row.get(reason_key, "")).strip()
+                    if not cur or cur == _TERM_REASON_NONE:
+                        row[reason_key] = _TERM_REASON_DEFAULT
+                else:
+                    row[reason_key] = _TERM_REASON_NONE
+
+            # Previous Wind/Hail Deductible must be a 0-5 code, never a dollar
+            # amount; only present when prior insurance = Yes. [DEF-005, Rule 64]
+            wh_key = _find_col(row, "previous wind/hail") or _find_col(row, "wind/hail deductible")
+            if wh_key and str(row.get(wh_key) or "").strip():
+                row[wh_key] = _coerce(
+                    row.get(wh_key), _WIND_HAIL_DEDUCTIBLES, _WIND_HAIL_DEDUCTIBLES[0]
+                )
 
             # Purchase dependencies (HO Rule 51-54 / DW New Purchase).
             np_key = (_find_col(row, "new purchase")
@@ -393,6 +483,12 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
                 eff_by_tid[_tid(pi)] = eff
 
         for row in rows:
+            # HO: "Any Open Claims?" must always be "No". [HO-011]
+            if self._force_open_claims_no:
+                oc_key = _find_col(row, "open claims")
+                if oc_key:
+                    row[oc_key] = "No"
+
             losses_key = _find_col(row, "losses in past 5 years")
             if losses_key and _is_no(row.get(losses_key)):
                 _blank_fields(row, "loss date", "type of loss", "details", "amount",
@@ -508,6 +604,7 @@ class DwHandler(_SpgPersonalLinesHandler):
     policy_type = "DW"
     _property_frags = ("location",)         # DF Locations
     _product_default = "Dwelling Fire DP-3"
+    _property_max = _MAX_LOCATIONS          # up to 20 locations per insured
 
     def _uw_history_rules(self, reuse_rule: str) -> str:
         return f"""
@@ -524,7 +621,7 @@ SPG DW — APPLICANT / INSURANCE HISTORY RULES (HARD CONSTRAINTS):
         return f"""
 SPG DW — DF LOCATIONS RULES (HARD CONSTRAINTS):
 {reuse_rule}
-- Loc #: sequential per scenario starting at 1. Generate 1+ locations per scenario.
+- Loc #: sequential per scenario starting at 1. Generate a MINIMUM of 1 and up to 20 locations per insured — create MULTIPLE location rows where applicable; never cap a scenario at a single location. [Rule 67]
 - Coverage A ($): positive number. Exclude Cov B?: Yes/No. If Yes, Coverage B Value blank; if No, Coverage B Value populated. [Rule 68-70/115-116]
 - Protection Class: 1-10. Good Condition / Existing Damage / Renovation / Single Family?: Yes/No. [Rule 71-75]
 - Single Family? = Yes → # Families blank; = No → # Families is 2, 3, or 4. [Rule 75-76/117-118]
@@ -533,7 +630,7 @@ SPG DW — DF LOCATIONS RULES (HARD CONSTRAINTS):
 - Foundation Type: Permanent Masonry (Slab/Crawlspace/Basement), Pilings, Pier, Other. Construction Type: Frame, Log Home, Masonry Veneer, Mixed - Frame and Masonry, Manufactured Home, Town Home. [Rule 84-85]
 - Wood Burning Stove? = Yes → WBS Primary Heat populated; = No → blank. [Rule 88-89/121-122]
 - Water Heater Yr / Roof Replacement Yr ≥ Year Built and ≤ current year. [Rule 90/93]
-- Roofing Material: Asphalt Shingle, Metal, Slate, Wood Shake, Rubberized Membrane. Siding Material per Rule 94.
+- Roofing Material: Asphalt Shingle, Metal, Slate, Wood Shake, Rubberized Membrane. Siding Material: one of {', '.join(_DW_SIDING)} ("Brick" is NOT a valid value). [Rule 94]
 - >2 Acres? = No → >10 Acres? blank or No. [Rule 95-96/123-124]
 - New Purchase? = Yes → Year Purchased + Purchase Price populated; = No → blank. [Rule 111-114/125-128]
 - Yes/No columns must be exactly "Yes" or "No".
@@ -586,6 +683,12 @@ SPG DW — DF COVERAGES RULES (HARD CONSTRAINTS):
             np_key = _find_col(row, "new purchase")
             if np_key and _is_no(row.get(np_key)):
                 _blank_fields(row, "year purchased", "was foreclosed", "purchase price")
+
+            # Siding Material must be a dropdown member ("Brick" is invalid). [DEF-008, Rule 94]
+            sid_key = _find_col(row, "siding material")
+            if sid_key:
+                row[sid_key] = _coerce(row.get(sid_key), _DW_SIDING,
+                                       _SIDING_DEFAULT, fill_blank=True)
         return rows
 
     def _fix_coverages(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -611,6 +714,7 @@ class HoHandler(_SpgPersonalLinesHandler):
     policy_type = "HO"
     _property_frags = ("dwelling",)         # HO Dwelling
     _product_default = "HO-3 Homeowners"
+    _force_open_claims_no = True            # HO-011: Any Open Claims? always "No"
 
     def _uw_history_rules(self, reuse_rule: str) -> str:
         return f"""
@@ -635,11 +739,12 @@ SPG HO — HO DWELLING RULES (HARD CONSTRAINTS):
 - Type of Dwelling (Primary/Secondary). Is Dwelling Rented to Others? only for Secondary. [Rule 77-78]
 - Is Dwelling a Manufactured Home?: Yes/No. [Rule 79]
 - Good Condition? = Yes; Existing Damage? = No; Undergoing Renovation? = No (eligibility). [Rule 80-82]
+- Within 1,000 ft of Water Source? / Fire Dept Response < 15 Min?: "Yes" ONLY when Protection Class > 8; otherwise "No". [Rule 83-84]
 - Type of Foundation: permanent masonry types preferred; Foundation Explain populated only when foundation = Other. [Rule 86-87]
 - Wood Burning Stove? = Yes → Is Wood Stove Primary Heating populated; = No → blank. [Rule 89-90]
 - Polybutylene/Qwest = No; Fuse Boxes = No; Aluminum Wiring = No; Knob/Tube = No; Lead Plumbing = No (eligibility). [Rule 91/93-96]
-- Year of Last Water Heater/Roof Replacement ≤ current year. Roofing Material excludes Slate, Wood Shake, Rubberized Membrane. Roof Flat? = No. [Rule 92/101-103]
-- Siding excludes Hardboard Composite, EIFS, Asbestos. [Rule 104]
+- Year of Last Water Heater/Roof Replacement ≤ current year. Type of Roofing Material: one of {', '.join(_HO_ROOFING)} (Slate, Wood Shake, Rubberized Membrane are ineligible). Roof Flat? = No. [Rule 92/101-103]
+- Type of Siding Material: one of {', '.join(_HO_SIDING)} (Hardboard Composite, EIFS, Asbestos are ineligible). [Rule 104]
 - More Than 2 Acres? then More Than 10 Acres? applies; >10 acres ineligible. [Rule 105-106]
 - Unfenced Pool / Animals With Bite History / Business Pursuits = No (eligibility). [Rule 107/110/112]
 - Yes/No columns must be exactly "Yes" or "No".
@@ -686,6 +791,28 @@ SPG HO — HO COVERAGES RULES (HARD CONSTRAINTS):
             rented_key = _find_col(row, "rented to others")
             if type_key and rented_key and str(row.get(type_key, "")).strip().lower() != "secondary":
                 row[rented_key] = ""
+
+            # Roofing / Siding must be dropdown members within HO eligibility.
+            # [HO-008 Rule 103, HO-009 Rule 104]
+            roof_key = _find_col(row, "roofing material")
+            if roof_key:
+                row[roof_key] = _coerce(row.get(roof_key), _HO_ROOFING,
+                                        _HO_ROOFING_DEFAULT, fill_blank=True)
+            sid_key = _find_col(row, "siding material")
+            if sid_key:
+                row[sid_key] = _coerce(row.get(sid_key), _HO_SIDING,
+                                       _SIDING_DEFAULT, fill_blank=True)
+
+            # Protection-Class dependency: "Within 1,000 ft of Water Source?" and
+            # "Fire Dept Response < 15 Min?" may be "Yes" only when Protection
+            # Class > 8; otherwise they must be "No". [HO-006, HO-007]
+            pc_key = _find_col(row, "protection class")
+            pc = _to_number(row.get(pc_key)) if pc_key else None
+            if pc is not None and pc <= 8:
+                for frag in ("water source", "fire dept response"):
+                    k = _find_col(row, frag)
+                    if k and _is_yes(row.get(k)):
+                        row[k] = "No"
         return rows
 
     def _fix_coverages(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

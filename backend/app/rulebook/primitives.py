@@ -10,6 +10,7 @@ Every formatter is idempotent on already-formatted input.
 """
 from __future__ import annotations
 
+import random
 from datetime import date, datetime
 from typing import Any, Sequence
 
@@ -88,6 +89,44 @@ def tid_value(row: dict) -> str:
     """The row's ``Test ID`` value (cross-sheet join key), trimmed."""
     k = next((key for key in row if key.lower().strip() == "test id"), None)
     return str(row.get(k, "")).strip() if k else ""
+
+
+def format_us_phone(val: Any) -> str:
+    """Format any phone/fax value as a standard U.S. number ``(XXX) XXX-XXXX``.
+
+    Strips to digits, drops a leading country-code ``1`` on 11-digit input, then
+    renders the canonical U.S. format. When the input cannot yield 10 digits
+    (the field is unusable as-is) a plausible 10-digit number is generated so the
+    cell is still a valid U.S. phone number. Idempotent on already-formatted
+    input. Used for continuous-digit phone/fax cells the LLM emits unformatted.
+    """
+    digits = "".join(c for c in str(val or "") if c.isdigit())
+    if len(digits) == 11 and digits[0] == "1":
+        digits = digits[1:]
+    if len(digits) != 10:
+        digits = f"{random.randint(200, 999)}{random.randint(200, 999)}{random.randint(0, 9999):04d}"
+    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
+
+
+def coerce_to_allowed(
+    val: Any, allowed: Sequence[Any], default: Any, *, fill_blank: bool = False
+) -> Any:
+    """Snap a value to a member of ``allowed`` (case/space-insensitive match).
+
+    Returns the canonical allowed option when ``val`` matches one; otherwise
+    ``default``. Blank values are left untouched unless ``fill_blank`` is set
+    (for mandatory dropdown fields that must always carry a value). The allowed
+    set is the ruleset's dropdown list, passed in by the caller — this primitive
+    holds no domain values itself.
+    """
+    s = str(val or "").strip()
+    if not s:
+        return default if fill_blank else val
+    low = s.lower()
+    for opt in allowed:
+        if low == str(opt).strip().lower():
+            return opt
+    return default
 
 
 def is_yes(val: Any) -> bool:
