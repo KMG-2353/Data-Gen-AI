@@ -159,3 +159,73 @@ def test_loss_history_capped_at_10(handler):
     } for i in range(15)]
     out = handler.post_process(rows, "HO Loss History", "", {"Policy Info": policy})
     assert len([r for r in out if r["Test ID"] == "x"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# HO-017 — "Is Dwelling a Manufactured Home?" must exercise Yes, not always No
+# ---------------------------------------------------------------------------
+
+def test_manufactured_home_varies(handler):
+    rows = [
+        {"Test ID": "TS-01", "Is Dwelling a Manufactured Home?": "No",
+         "Square Footage": "1800", "Protection Class": "5"}
+        for _ in range(9)
+    ]
+    out = handler.post_process(rows, "HO Dwelling", "")
+    seen = {r["Is Dwelling a Manufactured Home?"] for r in out}
+    assert "Yes" in seen and "No" in seen           # both values now appear
+
+
+def test_manufactured_home_yes_meets_min_sqft(handler):
+    from app.policies.spg_pl import _MANUFACTURED_MIN_SQFT
+    from app.rulebook.primitives import to_number
+    rows = [
+        {"Test ID": "TS-01", "Is Dwelling a Manufactured Home?": "No",
+         "Square Footage": "900", "Protection Class": "5"}
+        for _ in range(9)
+    ]
+    out = handler.post_process(rows, "HO Dwelling", "")
+    for r in out:
+        if r["Is Dwelling a Manufactured Home?"] == "Yes":
+            assert to_number(r["Square Footage"]) >= _MANUFACTURED_MIN_SQFT
+
+
+# ---------------------------------------------------------------------------
+# HO-018 — Coverage F is mandatory (non-blank) when Coverage E > $0
+# ---------------------------------------------------------------------------
+
+def test_coverage_f_filled_when_coverage_e_present(handler):
+    from app.policies.spg_pl import _HO_COVERAGE_F
+    rows = [
+        {"Test ID": "TS-01", "Coverage E — Limit of Liability": "$100,000",
+         "Coverage F — Increased Medical Payments": ""},        # blank -> must fill
+        {"Test ID": "TS-02", "Coverage E — Limit of Liability": "$300,000",
+         "Coverage F — Increased Medical Payments": "garbage"},  # invalid -> snap
+    ]
+    out = handler.post_process(rows, "HO Coverages", "")
+    for r in out:
+        assert r["Coverage F — Increased Medical Payments"] in _HO_COVERAGE_F
+
+
+def test_coverage_f_blank_when_coverage_e_excluded(handler):
+    rows = [{"Test ID": "TS-01", "Coverage E — Limit of Liability": "Excluded",
+             "Coverage F — Increased Medical Payments": "$5,000"}]
+    out = handler.post_process(rows, "HO Coverages", "")
+    assert out[0]["Coverage F — Increased Medical Payments"] == ""
+
+
+# ---------------------------------------------------------------------------
+# HO-010 / HO-012 — loss payees & loss history: multiple per scenario, capped 10
+# ---------------------------------------------------------------------------
+
+def test_ho_loss_payees_capped_at_10(handler):
+    rows = [{"Test ID": "TS-01", "State": "VA", "Is Mortgagee?": "No"} for _ in range(15)]
+    out = handler.post_process(rows, "HO LossPayees", "")
+    assert len(out) == 10
+
+
+def test_ho_child_counts_request_multiples(handler):
+    policy = [{"Test ID": "TS-01"}, {"Test ID": "TS-02"}]
+    lp_count, _ = handler.build_sheet_context("HO LossPayees", policy, None, 2)
+    lh_count, _ = handler.build_sheet_context("HO LossHistory", policy, None, 2)
+    assert lp_count >= 4 and lh_count >= 4

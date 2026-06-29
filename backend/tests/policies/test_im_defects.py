@@ -200,6 +200,117 @@ def test_loss_fields_blanked_when_no_losses(handler):
 # Scenario architecture: Test Scenario Details summarises real counts
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# DF-IM-013 — Type of Entity must exercise the full dropdown, not just Corp/LLC
+# ---------------------------------------------------------------------------
+
+def test_type_of_entity_varies_across_records(handler):
+    # The LLM collapsed every insured onto Corporation/LLC.
+    rows = [
+        {"Test ID": "PI-001", "Effective Date": "05/27/2026", "Type of Entity": "Corporation",
+         "Insured Full Name": "Acme Co", "Mailing Address State": "VA"}
+        for _ in range(8)
+    ]
+    out = handler.post_process(rows, "Policy Info", "")
+    seen = {r["Type of Entity"] for r in out}
+    # More than the two values QA observed, and all within the IM dropdown.
+    from app.policies.im import _IM_ENTITY_TYPES
+    assert seen.issubset(set(_IM_ENTITY_TYPES))
+    assert len(seen) >= 4
+
+
+def test_trust_rows_are_completed_not_left_empty(handler):
+    rows = [
+        {"Test ID": "PI-001", "Type of Entity": "x", "Insured Full Name": "Bob Smith",
+         "Mailing Address City": "Richmond", "Mailing Address State": "VA",
+         "Trustee Full Name": "", "Trustee Address City": "", "Trustee Address State": ""}
+        for _ in range(8)
+    ]
+    out = handler.post_process(rows, "Policy Info", "")
+    for r in out:
+        if str(r["Type of Entity"]).lower() == "trust":
+            assert r["Trustee Full Name"].strip()          # populated
+        else:
+            assert r["Trustee Full Name"] == ""            # blank for non-Trust
+
+
+# ---------------------------------------------------------------------------
+# DF-IM-009 — Override Reason only when Fee Override holds a value
+# ---------------------------------------------------------------------------
+
+def test_override_reason_cleared_when_no_fee_override(handler):
+    rows = [
+        {"Test ID": "PI-001", "Type of Entity": "LLC", "Fee Override": "",
+         "Override Reason": "Some stray reason"},
+        {"Test ID": "PI-002", "Type of Entity": "LLC", "Fee Override": "150",
+         "Override Reason": ""},
+    ]
+    out = handler.post_process(rows, "Policy Info", "")
+    assert out[0]["Override Reason"] == ""        # no override -> blank
+    assert out[1]["Override Reason"].strip()      # override present -> populated
+
+
+# ---------------------------------------------------------------------------
+# DF-IM-017 — Equipment: multiple rows per insured, capped at 20
+# ---------------------------------------------------------------------------
+
+def test_equipment_count_request_is_multiple_per_insured(handler):
+    policy = [{"Test ID": f"TS-00{i}"} for i in range(1, 4)]  # 3 insureds
+    count, _rules = handler.build_sheet_context("Equipment Schedule", policy, None, 3)
+    assert count >= 6                                          # not 1-per-insured
+
+
+def test_equipment_capped_at_20_per_insured(handler):
+    policy = [{"Test ID": "PI-001", "Scheduled Equipment Coverage": "Yes"}]
+    equipment = [{"Test ID": "PI-001", "Value ($)": "30000", "Loss Payee?": "No"}
+                 for _ in range(25)]
+    out = handler.post_process(equipment, "Equipment Schedule", "",
+                               {"Policy Info": policy})
+    assert len(out) == 20
+
+
+# ---------------------------------------------------------------------------
+# DF-IM-018 — Loss Payees: 1..10 per policy
+# ---------------------------------------------------------------------------
+
+def test_loss_payees_capped_at_10(handler):
+    rows = [{"Test ID": "PI-001", "State": "VA"} for _ in range(14)]
+    out = handler.post_process(rows, "IM LossPayees", "")
+    assert len(out) == 10
+
+
+def test_loss_payees_count_request_is_multiple(handler):
+    policy = [{"Test ID": "TS-001"}, {"Test ID": "TS-002"}]
+    count, _ = handler.build_sheet_context("IM LossPayees", policy, None, 2)
+    assert count >= 4
+
+
+# ---------------------------------------------------------------------------
+# DF-IM-010/011/012/014/015/016 — phone/fax format + address-state variety
+# are enforced by the universal SPG variety pass (app/rulebook/variety.py),
+# which main.py runs after this handler for every IM sheet.
+# ---------------------------------------------------------------------------
+
+def test_universal_pass_fixes_im_phone_and_states():
+    from app.rulebook.variety import enforce_variety_fields
+    from app.rulebook.primitives import is_us_state
+    rows = [
+        {"Test ID": "TS-001", "Binding State": "VA", "Agent Address State": "VA",
+         "Mailing Address State": "VA", "Coverage Address State": "VA",
+         "Agent Phone": "8045551234", "Agent Fax": "8045559999"},
+        {"Test ID": "TS-002", "Binding State": "MD", "Agent Address State": "MD",
+         "Mailing Address State": "MD", "Coverage Address State": "MD",
+         "Agent Phone": "3015550000", "Agent Fax": "3015551111"},
+    ]
+    enforce_variety_fields(rows)
+    for r in rows:
+        assert r["Agent Phone"].startswith("(")          # DF-IM-010/014
+        assert r["Agent Fax"].startswith("(")            # DF-IM-011
+        for c in ("Agent Address State", "Mailing Address State", "Coverage Address State"):
+            assert is_us_state(r[c])                      # DF-IM-012/015/016
+            assert r[c] != r["Binding State"]            # not collapsed onto binding
+
+
 def test_scenario_details_built_from_upstream(handler):
     previous = {
         "Policy Info": [

@@ -32,7 +32,26 @@ from app.rulebook.primitives import (
     default_test_id as _default_tid,
     is_yes as _is_yes,
     is_no as _is_no,
+    spread_pick as _spread_pick,
+    column_seed as _col_seed,
 )
+
+# Type of Entity dropdown — sourced verbatim from the SPG IM rater's
+# 01_Policy_Info data validation (``Individual,Corporation,LLC,Partnership,Trust,
+# Estate``). DF-IM-013: the LLM only ever emits Corporation/LLC, so the engine
+# fans the value across the full set instead. Single source; not a magic literal.
+_IM_ENTITY_TYPES = (
+    "Individual", "Corporation", "LLC", "Partnership", "Trust", "Estate",
+)
+
+# Per-insured child-row generation targets (ruleset upper bounds: equipment/
+# locations ≤ 20, loss payees ≤ 10). These drive the *minimum-multiple* request
+# so a sample never validates a single-child scenario (DF-IM-017/018); the per-
+# TID caps below enforce the maxima.
+_EQUIP_PER_INSURED = 4
+_LOSSPAYEE_PER_INSURED = 3
+_MAX_EQUIPMENT = 20
+_MAX_LOSS_PAYEES = 10
 
 
 def _get_policy_rows(previous: dict | None) -> list[dict]:
@@ -62,6 +81,10 @@ class ImHandler:
             return "misc_articles"
         if "loss history" in sn:
             return "loss_history"
+        # "IM LossPayees" child schedule (1-10 loss payees per policy, DF-IM-018).
+        # Checked before additional_interests; the two are distinct sheets.
+        if "losspayee" in sn or "loss payee" in sn:
+            return "loss_payees"
         if "additional interest" in sn:
             return "additional_interests"
         if "scenario" in sn or "scenerio" in sn:
@@ -91,11 +114,12 @@ class ImHandler:
             rules = """
 SPG INLAND MARINE — POLICY INFO RULES (HARD CONSTRAINTS):
 - Test ID: MUST follow the format TS-001, TS-002, TS-003, ... (sequential, zero-padded to 3 digits).
-- Binding State / Agency State / Mailing State / Coverage State: MUST be one of VA, MD, DC, PA, NC, WV, DE. All states within a record must be consistent. [Rule 1/19/29/34]
+- Binding State: ONLY this field is restricted — one of VA, MD, DC, PA, NC, WV, DE, CA, TX, GA, NV, SC, OH, AZ. [Rule 1]
+- Agent/Mailing/Coverage/Trustee/Garaging Address State: these are PHYSICAL-ADDRESS states and may be ANY valid US state — do NOT force them to equal the Binding State. VARY them across records (and across the different address blocks within a record), each consistent with its own City/ZIP. [Rule 19/29/34]
+- Type of Entity: VARY across records so all of Individual, Corporation, LLC, Partnership, Trust, Estate appear — not just Corporation/LLC. [Rule 23]
 - Effective Date: MM/DD/YYYY; MUST be on or before Expiration Date. [Rule 4]
 - Expiration Date: MM/DD/YYYY; later than Effective Date (typically Effective + Policy Term). [Rule 5]
 - Date of Quote: MM/DD/YYYY; MUST be LESS THAN OR EQUAL TO the Effective Date — NEVER after it. [Rule 9]
-- Type of Entity: one of Individual, Corporation, LLC, Partnership, Joint Venture, Trust, Estate. [Rule 23]
 - Trustee fields: populate ONLY when Type of Entity = Trust; otherwise leave ALL Trustee columns blank. [Rule 36/43]
 - Scheduled Equipment Coverage: "Yes" or "No". If "No", there must be NO Equipment Schedule rows for this Test ID. [Rule 44/46]
 - Miscellaneous Articles Coverage: "Yes" or "No". If "No", the Misc Articles total must be blank. [Rule 45]
@@ -106,13 +130,23 @@ SPG INLAND MARINE — POLICY INFO RULES (HARD CONSTRAINTS):
             rules = """
 SPG INLAND MARINE — EQUIPMENT SCHEDULE RULES (HARD CONSTRAINTS):
 - Test ID: reuse the SAME TS-### IDs from Policy Info. Generate equipment ONLY for insureds whose "Scheduled Equipment Coverage" = Yes. [Rule 46]
+- Generate MULTIPLE equipment/location rows per insured (a realistic mix, e.g. 2-6, up to a maximum of 20) — never a single row per insured. [Rule 46 / DF-IM-017]
 - Value ($): a PLAIN NUMBER greater than 25000 and not exceeding 50000 (e.g. 38500). NO "$", NO commas, NO quotes. [Rule 50]
 - Serial Number: unique alphanumeric per item. [Rule 49]
 - Used for Logging?: "Yes" or "No". [Rule 51]
 - Loss Payee?: "Yes" or "No". If "No", leave Loss Payee Name and all LP Address fields blank. [Rule 52/53]
-- LP Addr State (when Loss Payee? = Yes): one of VA, MD, DC, PA, NC, WV, DE, AL. [Rule 55]
+- LP Addr State (when Loss Payee? = Yes): any valid US state, varied and consistent with the LP City/ZIP — NOT limited to the binding state. [Rule 55]
 """
-            return original_row_count, rules
+            return self._child_count(original_row_count, policy_data, _EQUIP_PER_INSURED), rules
+
+        if sheet_type == "loss_payees":
+            rules = """
+SPG INLAND MARINE — LOSS PAYEES RULES (HARD CONSTRAINTS):
+- Test ID: reuse the SAME TS-### IDs from Policy Info.
+- Generate a MINIMUM of 1 and a MAXIMUM of 10 Loss Payee rows per policy — create MULTIPLE rows where applicable; never cap a policy at a single loss payee. [DF-IM-018]
+- State: any valid US state, varied and consistent with City/ZIP — NOT limited to the binding state.
+"""
+            return self._child_count(original_row_count, policy_data, _LOSSPAYEE_PER_INSURED), rules
 
         if sheet_type == "misc_articles":
             rules = """
@@ -152,13 +186,28 @@ SPG INLAND MARINE — LOSS HISTORY RULES (HARD CONSTRAINTS):
 SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 - Test ID: reuse the SAME TS-### IDs from Policy Info.
 - Any Loss Payees on Scheduled Equipment?: "Yes" or "No". If "No", leave all Loss Payee fields blank. [Rule 69]
-- State: one of VA, MD, DC, PA, NC, WV, DE, AL. [Rule 75]
+- State: any valid US state, varied and consistent with City/ZIP — NOT limited to the binding state. [Rule 75]
 - For Equipment #: must reference an existing Scheduled Equipment item number. [Rule 77]
 - Interest Type: one of Loss Payable, Lender's Loss Payable, Contract Sale. [Rule 78]
 """
             return original_row_count, rules
 
         return original_row_count, ""
+
+    @staticmethod
+    def _child_count(
+        original: int, policy_data: list[dict[str, Any]] | None, per_insured: int
+    ) -> int:
+        """Row count for a child sheet that should carry MULTIPLE rows per insured.
+
+        The LLM under-produces child rows (one per insured), so the request is
+        deterministically scaled to ``num_insureds * per_insured`` — guaranteeing
+        a multi-child sample (DF-IM-017/018). Round-robin Test-ID assignment plus
+        the per-TID caps in post-processing turn this into a balanced, capped
+        spread. Falls back to ``original`` when the policy sheet isn't available.
+        """
+        n = len(policy_data) if policy_data else 0
+        return max(original, n * per_insured) if n else original
 
     # ------------------------------------------------------------------
     # Deterministic pre-generation
@@ -200,17 +249,37 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
             return self._fix_misc_articles(rows)
         if sheet_type == "loss_history":
             return self._fix_loss_history(rows, previous_sheets_data)
+        if sheet_type == "loss_payees":
+            # DF-IM-018: at most 10 loss payees per policy (the minimum-multiple
+            # is driven by the generation count + prompt).
+            return self._cap_per_tid(rows, _MAX_LOSS_PAYEES)
         if sheet_type == "additional_interests":
             return self._fix_additional_interests(rows)
         return rows
+
+    @staticmethod
+    def _cap_per_tid(rows: list[dict[str, Any]], max_n: int) -> list[dict[str, Any]]:
+        """Keep at most ``max_n`` child rows per Test ID (ruleset upper bound)."""
+        seen: dict[str, int] = {}
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            tid = _tid(row)
+            seen[tid] = seen.get(tid, 0) + 1
+            if seen[tid] <= max_n:
+                out.append(row)
+        return out
 
     # ------------------------------------------------------------------
     # Per-sheet fixers
     # ------------------------------------------------------------------
 
     def _fix_policy_info(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Stamp Test IDs, clamp Date of Quote <= Effective Date (Rule 9),
-        and blank Trustee fields for non-Trust entities (Rule 36/43)."""
+        """Stamp Test IDs, clamp Date of Quote <= Effective Date (Rule 9), fan
+        Type of Entity across the full dropdown (DF-IM-013), keep Override Reason
+        gated on Fee Override (DF-IM-009), and reconcile Trustee fields with the
+        (possibly reassigned) entity (Rule 36/43)."""
+        entity_key = _find_col(rows[0], "type of entity") if rows else None
+        ent_seed = _col_seed(entity_key or "type of entity")
         for idx, row in enumerate(rows):
             tid_key = next((k for k in row if k.lower().strip() == "test id"), None)
             if tid_key is not None:
@@ -226,16 +295,69 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                     # Place the quote a few days before the effective date.
                     row[quote_key] = _fmt_date(eff - timedelta(days=random.randint(1, 14)))
 
-            # Rule 36/43: Trustee fields only for Type of Entity = Trust.
-            entity_key = _find_col(row, "type of entity")
+            # DF-IM-013: the LLM collapses Type of Entity onto Corporation/LLC.
+            # Deterministically fan it across the full dropdown so every option is
+            # exercised. Done BEFORE the Trustee reconciliation below so a row
+            # reassigned to "Trust" is completed, not left half-populated.
+            if entity_key:
+                row[entity_key] = _spread_pick(idx, _IM_ENTITY_TYPES, seed=ent_seed)
+
+            # DF-IM-009: Override Reason is populated ONLY when Fee Override holds
+            # a value; clear it otherwise (and, symmetrically, give it a reason
+            # when an override amount is present but the reason was left blank).
+            self._reconcile_override_reason(row)
+
+            # Rule 36/43: Trustee fields only for Type of Entity = Trust. After a
+            # spread reassignment, blank them for non-Trust rows and fill a
+            # deterministic trustee (derived from the insured) for Trust rows so
+            # the Trust case is complete rather than empty.
             if entity_key:
                 is_trust = str(row.get(entity_key, "")).strip().lower() == "trust"
-                if not is_trust:
+                if is_trust:
+                    self._complete_trustee(row)
+                else:
                     for k in list(row.keys()):
                         if "trustee" in k.lower():
                             row[k] = ""
 
         return rows
+
+    @staticmethod
+    def _reconcile_override_reason(row: dict[str, Any]) -> None:
+        """Keep Override Reason consistent with Fee Override (DF-IM-009).
+
+        The reason is meaningful only when an override amount exists. No-ops when
+        the template carries neither column.
+        """
+        reason_key = _find_col(row, "override reason")
+        fee_key = _find_col(row, "fee override") or _find_col(row, "override amount")
+        if not reason_key or not fee_key:
+            return
+        has_override = str(row.get(fee_key) or "").strip() not in ("", "0", "0.0")
+        if not has_override:
+            row[reason_key] = ""
+        elif not str(row.get(reason_key) or "").strip():
+            row[reason_key] = "Underwriter fee adjustment"
+
+    @staticmethod
+    def _complete_trustee(row: dict[str, Any]) -> None:
+        """Populate Trustee fields for a Trust insured from the insured's own
+        identity/mailing address, so a spread-assigned Trust row is valid.
+
+        Deterministic derivation (no fabricated geography): mirrors the Mailing
+        address into the Trustee address and names the trust after the insured.
+        Only fills blanks — never overwrites trustee data the LLM already produced.
+        """
+        name_key = _find_col(row, "trustee full name")
+        insured_key = _find_col(row, "insured full name")
+        if name_key and not str(row.get(name_key) or "").strip():
+            insured = str(row.get(insured_key, "") or "").strip()
+            row[name_key] = (f"{insured} Trust" if insured else "Family Trust")
+        for frag in ("street 1", "street 2", "city", "state", "zip"):
+            t_key = _find_col(row, "trustee address", frag)
+            m_key = _find_col(row, "mailing address", frag)
+            if t_key and m_key and not str(row.get(t_key) or "").strip():
+                row[t_key] = row.get(m_key, "")
 
     def _fix_equipment(
         self,
@@ -255,11 +377,19 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                 coverage_by_tid[_tid(pi)] = _is_yes(pi.get(cov_key))
 
         kept: list[dict[str, Any]] = []
+        per_tid: dict[str, int] = {}
         for row in rows:
             tid = _tid(row)
             # DF-IM-003 / DF-IM-004: skip equipment rows for insureds whose
             # Scheduled Equipment Coverage = No.
             if tid in coverage_by_tid and not coverage_by_tid[tid]:
+                continue
+
+            # DF-IM-017: a single insured may carry up to 20 equipment/location
+            # rows — cap the over-produced excess (the multi-row minimum is driven
+            # by the generation count + prompt).
+            per_tid[tid] = per_tid.get(tid, 0) + 1
+            if per_tid[tid] > _MAX_EQUIPMENT:
                 continue
 
             # DF-IM-006: Value ($) numeric, clamped to (25000, 50000].

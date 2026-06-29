@@ -30,6 +30,8 @@ from app.rulebook.primitives import (
     is_no as _is_no,
     format_us_phone as _fmt_phone,
     coerce_to_allowed as _coerce,
+    spread_pick as _spread_pick,
+    column_seed as _col_seed,
 )
 
 # ---------------------------------------------------------------------------
@@ -65,6 +67,24 @@ _HO_ROOFING_DEFAULT = "Asphalt Shingle"
 _MAX_LOSS_PAYEES = 10
 _MAX_LOSS_HISTORY = 10
 _MAX_LOCATIONS = 20
+
+# Per-insured child-row generation targets — drive the *minimum-multiple* request
+# so a sample never validates a single-child scenario (DEF-007/009/010,
+# HO-010/012). The caps above enforce the maxima.
+_LOCATIONS_PER_INSURED = 4
+_LOSS_PAYEES_PER_INSURED = 3
+_LOSS_HISTORY_PER_INSURED = 3
+
+# Coverage F — Increased Medical Payments (LKP col S, minus the Excluded/$0 cases
+# that only apply when Coverage E is itself excluded). Mandatory & non-blank
+# whenever Coverage E > $0 (Rule 135 / HO-018).
+_HO_COVERAGE_F = ("$1,000", "$5,000", "$10,000")
+_HO_COVERAGE_F_DEFAULT = "$1,000"
+
+# "Is Dwelling a Manufactured Home?" must exercise BOTH values, not always "No"
+# (HO-017). A manufactured dwelling needs ≥ 1,344 sq ft (Rule 73), enforced on
+# the same sheet when a row is varied to Yes.
+_MANUFACTURED_MIN_SQFT = 1344
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +230,7 @@ SPG PERSONAL LINES — POLICY INFO RULES (HARD CONSTRAINTS):
 - Date of Birth: an adult (18-100), never in the future. [Rule 28]
 - Additional Resident/Spouse?: Yes/No. If No, leave ALL "Add. Resident" fields blank. [Rule 29]
 - Mailing Address Different?: Yes/No. If No, leave ALL Mailing fields blank. [Rule 39]
+- Binding State ONLY is restricted to {', '.join(_BINDING_STATES)}. The Agency Address State, Insured Address (Address – State) and Mailing State are PHYSICAL-ADDRESS states: they may be ANY valid US state, VARIED across records and each consistent with its own City/ZIP — do NOT force them to equal the Binding State. [DEF-011/012/013]
 - All state fields must be 2-letter codes consistent with their city/ZIP.
 """
             return original_row_count, rules
@@ -218,7 +239,11 @@ SPG PERSONAL LINES — POLICY INFO RULES (HARD CONSTRAINTS):
             return original_row_count, self._uw_history_rules(reuse_rule)
 
         if st == "property":
-            return original_row_count, self._property_rules(reuse_rule)
+            # DW caps locations per insured and must carry MULTIPLE of them.
+            count = (self._child_count(original_row_count, policy_data,
+                                       _LOCATIONS_PER_INSURED)
+                     if self._property_max else original_row_count)
+            return count, self._property_rules(reuse_rule)
 
         if st == "coverages":
             return original_row_count, self._coverages_rules(reuse_rule)
@@ -227,11 +252,12 @@ SPG PERSONAL LINES — POLICY INFO RULES (HARD CONSTRAINTS):
             rules = f"""
 SPG PERSONAL LINES — LOSS PAYEES RULES (HARD CONSTRAINTS):
 {reuse_rule}
-- Generate realistic lender / bank / mortgage company names. State is a 2-letter code consistent with City/ZIP.
+- Generate realistic lender / bank / mortgage company names. State may be ANY valid US state (varied, consistent with City/ZIP) — NOT limited to the binding state.
 - Is Mortgagee?: Yes/No. If No, leave Loan Number and Mortgage Current? BLANK. If Yes, both MUST be populated (Loan Number = unique alphanumeric). [Rule 119/120/121]
-- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss-payee rows per scenario. [Rule 119]
+- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss-payee rows per scenario — create MULTIPLE rows where applicable; never a single payee. [Rule 119 / DEF-009 / HO-010]
 """
-            return original_row_count, rules
+            return self._child_count(original_row_count, policy_data,
+                                     _LOSS_PAYEES_PER_INSURED), rules
 
         if st == "loss_history":
             eff_hint = self._effective_date_hint(policy_data)
@@ -244,12 +270,28 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
 - Loss Date: MM/DD/YYYY, within the 5 years before the Effective Date AND earlier than it. [Rule 148/126]
 - Type of Loss: one of Fire, Water Damage – Weather Related, Water Damage – Non-Weather Related, Wind Damage, Hail Damage, Theft, Physical Damage – All Other, Liability. [Rule 149/127]
 - Amount ($): a PLAIN positive number > 0 (no $, no commas). [Rule 151/129]
-- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss rows per scenario (one row per loss). For no-loss scenarios use a single blank-loss row. [Rule 145/123]
+- Generate a MINIMUM of 1 and a MAXIMUM of 10 loss rows per scenario (one row per loss) — create MULTIPLE loss rows for loss scenarios. For no-loss scenarios use a single blank-loss row. [Rule 145/123 / DEF-010 / HO-012]
 {eff_hint}
 """
-            return original_row_count, rules
+            return self._child_count(original_row_count, policy_data,
+                                     _LOSS_HISTORY_PER_INSURED), rules
 
         return original_row_count, ""
+
+    @staticmethod
+    def _child_count(
+        original: int, policy_data: list[dict] | None, per_insured: int
+    ) -> int:
+        """Row count for a child sheet that should carry MULTIPLE rows per insured.
+
+        The LLM under-produces child rows (one per insured), so the request is
+        scaled to ``num_insureds * per_insured``; round-robin Test-ID assignment
+        and the per-TID caps turn it into a balanced, capped spread. Falls back to
+        ``original`` when the policy sheet isn't available yet. [DEF-007/009/010,
+        HO-010/012]
+        """
+        n = len(policy_data) if policy_data else 0
+        return max(original, n * per_insured) if n else original
 
     def _effective_date_hint(self, policy_data: list[dict] | None) -> str:
         if not policy_data:
@@ -769,6 +811,21 @@ SPG HO — HO COVERAGES RULES (HARD CONSTRAINTS):
 """
 
     def _fix_property(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # HO-017: "Is Dwelling a Manufactured Home?" is always generated as "No".
+        # Deterministically vary it (~1 in 3 → Yes) so both values are exercised;
+        # a manufactured dwelling needs ≥ 1,344 sq ft (Rule 73), enforced on this
+        # same sheet for any row varied to Yes.
+        mh_key = _find_col(rows[0], "manufactured home") if rows else None
+        if mh_key:
+            mh_seed = _col_seed(mh_key)
+            sqft_key = _find_col(rows[0], "square footage")
+            for i, row in enumerate(rows):
+                row[mh_key] = _spread_pick(i, ("No", "No", "Yes"), seed=mh_seed)
+                if _is_yes(row.get(mh_key)) and sqft_key:
+                    sqft = _to_number(row.get(sqft_key))
+                    if sqft is None or sqft < _MANUFACTURED_MIN_SQFT:
+                        row[sqft_key] = _MANUFACTURED_MIN_SQFT
+
         for row in rows:
             # Wood stove not present → primary-heating answer blank. [Rule 90]
             ws_key = _find_col(row, "wood burning stove")
@@ -816,8 +873,10 @@ SPG HO — HO COVERAGES RULES (HARD CONSTRAINTS):
         return rows
 
     def _fix_coverages(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for row in rows:
-            # Coverage F only available when Coverage E > $0. [Rule 135]
+        f_seed = _col_seed("coverage f")
+        for i, row in enumerate(rows):
+            # Coverage F is blank when Coverage E is excluded, and MANDATORY
+            # (non-blank) when Coverage E > $0. [Rule 135 / HO-018]
             e_key = _find_col(row, "coverage e")
             f_key = _find_col(row, "coverage f")
             if e_key and f_key:
@@ -825,6 +884,12 @@ SPG HO — HO COVERAGES RULES (HARD CONSTRAINTS):
                 e_excluded = str(row.get(e_key, "")).strip().lower() in ("excluded", "") or (e_num == 0)
                 if e_excluded:
                     row[f_key] = ""
+                else:
+                    # HO-018: F must carry a valid value; snap an out-of-list or
+                    # blank cell to a varied member of the Coverage F dropdown.
+                    cur = str(row.get(f_key, "")).strip()
+                    if cur not in _HO_COVERAGE_F:
+                        row[f_key] = _spread_pick(i, _HO_COVERAGE_F, seed=f_seed)
 
             # Roof Valuation default for regular homes. [Rule 148]
             rv_key = _find_col(row, "roof valuation")

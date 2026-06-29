@@ -278,6 +278,11 @@ def detect_policy_type(filename: str) -> str:
     # SPG Inland Marine rater (filename like "SPG_IM_Rater_...").
     if name.startswith("SPG_IM") or "IM_RATER" in name:
         return "IM"
+    # SPG commercial-auto raters (filename like "SPG_Cargo_..." / "SPG_APD_...").
+    if "CARGO" in name:
+        return "CARGO"
+    if "_APD" in name or name.startswith("APD"):
+        return "APD"
     # SPG Personal Lines raters. DW checked first so the combined HO_DW template
     # (which carries DF sheets too) routes to the Dwelling Fire handler.
     if "_DW" in name:
@@ -340,6 +345,21 @@ def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
     rrg_spaced_hits = sum(1 for kw in rrg_spaced if any(kw in s for s in sheets_lower))
     if rrg_spaced_hits >= 2:
         return "RRG"
+
+    # SPG commercial-auto raters (Cargo / APD): a commodities schedule plus
+    # power-unit/trailer schedules. Distinguished from IMS commercial-auto by the
+    # explicit Cargo/APD tokens and the commodities+units signature.
+    has_commodities = any("commodit" in s for s in sheets_lower)
+    has_trailers = any("trailer" in s for s in sheets_lower)
+    has_power_units = any("power unit" in s or "sched of power" in s for s in sheets_lower)
+    cargo_token = any("cargo" in s for s in sheets_lower) or any(
+        "motor truck cargo" in h for h in all_headers_lower
+    )
+    apd_token = any("apd" in s or "auto physical damage" in s for s in sheets_lower)
+    if has_commodities and (apd_token or has_trailers) and not cargo_token:
+        return "APD"
+    if cargo_token or (has_commodities and has_power_units):
+        return "CARGO"
 
     # IM (SPG Inland Marine rater): distinctive Equipment Schedule + Misc
     # Articles + Loss History sheet combination, or the Scheduled Equipment

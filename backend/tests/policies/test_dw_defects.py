@@ -179,3 +179,61 @@ def test_loss_history_capped_at_10(handler):
     } for i in range(15)]
     out = handler.post_process(rows, "DF Loss history", "", {"Policy Info": policy})
     assert len([r for r in out if r["Test ID"] == "x"]) == 10
+
+
+# ---------------------------------------------------------------------------
+# DEF-007 — DF Locations: multiple per insured, capped at 20
+# ---------------------------------------------------------------------------
+
+def test_df_locations_count_request_is_multiple(handler):
+    policy = [{"Test ID": "TS-01"}, {"Test ID": "TS-02"}]   # 2 insureds
+    count, _ = handler.build_sheet_context("DF Locations", policy, None, 2)
+    assert count >= 4                                         # not 1-per-insured
+
+
+def test_df_locations_capped_at_20(handler):
+    rows = [{"Test ID": "TS-01", "Loc #": str(i), "State": "VA",
+             "Single Family?": "Yes", "Siding Material": "Vinyl"}
+            for i in range(25)]
+    out = handler.post_process(rows, "DF Locations", "")
+    assert len(out) == 20
+
+
+# ---------------------------------------------------------------------------
+# DEF-009 / DEF-010 — DF loss payees & loss history: multiple, capped at 10
+# ---------------------------------------------------------------------------
+
+def test_df_loss_payees_capped_at_10(handler):
+    rows = [{"Test ID": "TS-01", "State": "VA", "Is Mortgagee?": "No"} for _ in range(13)]
+    out = handler.post_process(rows, "DF LossPayees", "")
+    assert len(out) == 10
+
+
+def test_df_child_counts_request_multiples(handler):
+    policy = [{"Test ID": "TS-01"}, {"Test ID": "TS-02"}]
+    lp, _ = handler.build_sheet_context("DF LossPayees", policy, None, 2)
+    lh, _ = handler.build_sheet_context("DF LossHistory", policy, None, 2)
+    loc, _ = handler.build_sheet_context("DF Locations", policy, None, 2)
+    assert lp >= 4 and lh >= 4 and loc >= 4
+
+
+# ---------------------------------------------------------------------------
+# DEF-011/012/013/014/016 — address-state variety via the universal pass
+# ---------------------------------------------------------------------------
+
+def test_universal_pass_fixes_dw_states():
+    from app.rulebook.variety import enforce_variety_fields
+    from app.rulebook.primitives import is_us_state
+    rows = [
+        {"Test ID": "TS-01", "Binding State": "VA", "Agency Address State": "VA",
+         "Address – State": "VA", "Mailing State": "VA"},
+        {"Test ID": "TS-02", "Binding State": "MD", "Agency Address State": "MD",
+         "Address – State": "MD", "Mailing State": "MD"},
+        {"Test ID": "TS-03", "Binding State": "PA", "Agency Address State": "PA",
+         "Address – State": "PA", "Mailing State": "PA"},
+    ]
+    enforce_variety_fields(rows)
+    for r in rows:
+        for c in ("Agency Address State", "Address – State", "Mailing State"):
+            assert is_us_state(r[c])
+            assert r[c] != r["Binding State"]

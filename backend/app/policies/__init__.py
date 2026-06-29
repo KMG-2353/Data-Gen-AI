@@ -17,6 +17,7 @@ from .ims import ImsHandler
 from .rrg import RrgHandler
 from .im import ImHandler
 from .spg_pl import DwHandler, HoHandler
+from .spg_auto import CargoHandler, ApdHandler
 
 
 _HANDLERS: dict[str, PolicyHandler] = {
@@ -27,6 +28,8 @@ _HANDLERS: dict[str, PolicyHandler] = {
     "IM": ImHandler(),
     "DW": DwHandler(),
     "HO": HoHandler(),
+    "CARGO": CargoHandler(),
+    "APD": ApdHandler(),
 }
 
 

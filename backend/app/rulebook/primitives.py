@@ -129,6 +129,82 @@ def coerce_to_allowed(
     return default
 
 
+# ---------------------------------------------------------------------------
+# US state codes — single source of the address-state domain.
+#
+# Sourced verbatim from the raters' own full-state dropdown (the
+# ``15_LKP_Dropdowns`` column the Address/Garaging/Mailing/Agency/Insured/
+# Location/Loss-Payee state fields validate against, e.g. SPG IM/Cargo/APD list
+# ``AL,AK,AZ,...`` and the SPG PL list ``$A$5:$A$54``). These are the *physical
+# address* states — distinct from a template's restricted **Binding/Rating
+# State** dropdown (a small per-template subset). The recurring QA defect is that
+# the agent collapses address-state fields onto the binding subset instead of
+# exercising this full set; this list is the shared, single-sourced pool the
+# variety pass spreads across (it is US domain data, not a per-template magic
+# list — handlers/profiles never re-declare it).
+# ---------------------------------------------------------------------------
+US_STATES: tuple[str, ...] = (
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+)
+# DC is offered by some raters (IM/Cargo/APD) but not the SPG PL list; callers
+# that want it pass this wider pool explicitly.
+US_STATES_DC: tuple[str, ...] = US_STATES + ("DC",)
+
+_US_STATE_SET = frozenset(US_STATES_DC)
+
+
+def is_us_state(val: Any) -> bool:
+    """True when ``val`` is a 2-letter US state (or DC) code, case-insensitive."""
+    return str(val or "").strip().upper() in _US_STATE_SET
+
+
+def is_binding_state_field(name: str) -> bool:
+    """True when a column is the restricted **Binding/Rating** state dropdown.
+
+    Every other ``*state*`` column on these raters is a physical-address state
+    that validates against the full :data:`US_STATES` list. This single predicate
+    lets the variety pass tell the two apart by header name alone (no per-template
+    column list), so it stays adaptive to new raters that follow the convention.
+    """
+    nl = str(name or "").lower()
+    return "state" in nl and ("binding" in nl or "rating" in nl)
+
+
+def spread_pick(
+    index: int,
+    allowed: Sequence[Any],
+    *,
+    seed: int = 0,
+    avoid: Any = None,
+) -> Any:
+    """Deterministically pick one of ``allowed`` for row ``index``.
+
+    Cycles ``allowed`` by ``(seed + index)`` so a column's values fan out across
+    rows (guaranteeing the full set is exercised once enough rows exist) while
+    staying stable/idempotent for a given (seed, index). ``avoid`` is dropped from
+    the pool first (used to keep an address state off the row's binding state).
+    Returns ``None`` only when the pool is empty after exclusion.
+    """
+    pool = [a for a in allowed if a != avoid] or list(allowed)
+    if not pool:
+        return None
+    return pool[(int(seed) + int(index)) % len(pool)]
+
+
+def column_seed(name: str) -> int:
+    """Stable small non-negative seed derived from a column name.
+
+    Lets sibling columns (Agency State vs Mailing State vs Address State) spread
+    on different phases so a single row shows *combinations* of states rather than
+    the same value repeated across its address fields.
+    """
+    return sum(ord(c) for c in str(name or "")) % 97
+
+
 def is_yes(val: Any) -> bool:
     return str(val or "").strip().lower() in ("yes", "y", "true", "1")
 

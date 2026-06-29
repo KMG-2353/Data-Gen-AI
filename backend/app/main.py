@@ -14,6 +14,12 @@ from app.policies import get_handler
 from app.rulebook import config as rb_config
 from app.rulebook.profiles import select_profile
 from app.rulebook.scenario import parse_scenarios
+from app.rulebook.variety import enforce_variety_fields
+
+# SPG rater family that shares the universal dropdown-variety contract
+# (phone/fax format + address-state spread). RRG/IMS/PAP manage their own
+# (restricted) states and are intentionally excluded.
+_SPG_LOBS = frozenset({"IM", "DW", "HO", "CARGO", "APD"})
 from app.policies.ims import (
     canonical_sheet_name as _ims_canonical_sheet_name,
     extract_lob_flags as _ims_extract_lob_flags,
@@ -329,6 +335,20 @@ async def generate_data(request: dict):
                 special_instruction=augmented_special,
                 previous_sheets_data=previous_sheets_data if previous_sheets_data else None,
             )
+
+            # SPG family (IM/DW/HO/Cargo/APD): universal dropdown-variety pass —
+            # snap phone/fax to U.S. format and fan address-state columns across
+            # the full US-state pool (never collapsing onto the binding state).
+            # Runs AFTER the handler so dependency-blanked cells stay blank;
+            # honours a UI state filter when present. Deterministic summary sheets
+            # are skipped (their state mirrors the binding state by design).
+            if (
+                rb_config.RULEBOOK_ENABLED
+                and policy_type in _SPG_LOBS
+                and sheet_type != "scenario_details"
+                and data
+            ):
+                data = enforce_variety_fields(data, state_selection=state_selection)
 
             # IMS: once the Policy sheet is done, extract LOB flags so later
             # sub-sheets can be filtered (Defect #216: LOB=No → drop row).
