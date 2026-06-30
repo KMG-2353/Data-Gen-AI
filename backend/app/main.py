@@ -19,7 +19,7 @@ from app.rulebook.variety import enforce_variety_fields
 # SPG rater family that shares the universal dropdown-variety contract
 # (phone/fax format + address-state spread). RRG/IMS/PAP manage their own
 # (restricted) states and are intentionally excluded.
-_SPG_LOBS = frozenset({"IM", "DW", "HO", "CARGO", "APD"})
+_SPG_LOBS = frozenset({"IM", "DW", "HO", "CARGO", "APD", "WH"})
 from app.policies.ims import (
     canonical_sheet_name as _ims_canonical_sheet_name,
     extract_lob_flags as _ims_extract_lob_flags,

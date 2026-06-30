@@ -34,7 +34,9 @@ from app.rulebook.primitives import (
     is_no as _is_no,
     spread_pick as _spread_pick,
     column_seed as _col_seed,
+    normalize_sheet_name as _norm_sheet,
 )
+from app.rulebook.variety import ensure_child_row_multiplicity
 
 # Type of Entity dropdown — sourced verbatim from the SPG IM rater's
 # 01_Policy_Info data validation (``Individual,Corporation,LLC,Partnership,Trust,
@@ -72,23 +74,26 @@ class ImHandler:
     # ------------------------------------------------------------------
 
     def detect_sheet_type(self, sheet_name: str) -> str:
-        sn = sheet_name.lower().strip()
+        # Normalised so both the legacy spaced names ("Equipment Schedule",
+        # "IM LossPayees") and the numbered template names ("03_IM_Equipment",
+        # "05_IM_LossPayees") resolve to the same sheet type.
+        sn = _norm_sheet(sheet_name)
         if "policy info" in sn:
             return "policy"
-        if "equipment schedule" in sn:
-            return "equipment"
-        if "misc articles" in sn or "miscellaneous articles" in sn:
+        if "scenario" in sn or "scenerio" in sn:
+            return "scenario_details"
+        # "MiscArticles" must beat the bare "equipment"/"loss" checks below.
+        if "miscarticles" in sn or "misc articles" in sn or "miscellaneous articles" in sn:
             return "misc_articles"
-        if "loss history" in sn:
+        if "equipment" in sn:
+            return "equipment"
+        if "loss history" in sn or "losshistory" in sn:
             return "loss_history"
         # "IM LossPayees" child schedule (1-10 loss payees per policy, DF-IM-018).
-        # Checked before additional_interests; the two are distinct sheets.
         if "losspayee" in sn or "loss payee" in sn:
             return "loss_payees"
         if "additional interest" in sn:
             return "additional_interests"
-        if "scenario" in sn or "scenerio" in sn:
-            return "scenario_details"
         return "unknown"
 
     # ------------------------------------------------------------------
@@ -250,9 +255,7 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
         if sheet_type == "loss_history":
             return self._fix_loss_history(rows, previous_sheets_data)
         if sheet_type == "loss_payees":
-            # DF-IM-018: at most 10 loss payees per policy (the minimum-multiple
-            # is driven by the generation count + prompt).
-            return self._cap_per_tid(rows, _MAX_LOSS_PAYEES)
+            return self._fix_loss_payees(rows)
         if sheet_type == "additional_interests":
             return self._fix_additional_interests(rows)
         return rows
@@ -286,7 +289,8 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                 row[tid_key] = _default_tid(idx + 1)
 
             eff_key = _find_col(row, "effective date")
-            quote_key = _find_col(row, "date of quote")
+            # "Date of Quote" (legacy) / "Quote Date" (numbered template).
+            quote_key = _find_col(row, "date of quote") or _find_col(row, "quote date")
             if eff_key and quote_key:
                 eff = _parse_date(row.get(eff_key))
                 quote = _parse_date(row.get(quote_key))
@@ -377,19 +381,12 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                 coverage_by_tid[_tid(pi)] = _is_yes(pi.get(cov_key))
 
         kept: list[dict[str, Any]] = []
-        per_tid: dict[str, int] = {}
         for row in rows:
             tid = _tid(row)
             # DF-IM-003 / DF-IM-004: skip equipment rows for insureds whose
-            # Scheduled Equipment Coverage = No.
+            # Scheduled Equipment Coverage = No (legacy template gate; the numbered
+            # template has no per-insured gate, so this is a no-op there).
             if tid in coverage_by_tid and not coverage_by_tid[tid]:
-                continue
-
-            # DF-IM-017: a single insured may carry up to 20 equipment/location
-            # rows — cap the over-produced excess (the multi-row minimum is driven
-            # by the generation count + prompt).
-            per_tid[tid] = per_tid.get(tid, 0) + 1
-            if per_tid[tid] > _MAX_EQUIPMENT:
                 continue
 
             # DF-IM-006: Value ($) numeric, clamped to (25000, 50000].
@@ -405,7 +402,8 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                     num = 50000
                 row[val_key] = num
 
-            # Rule 53-56: blank Loss Payee detail fields when Loss Payee? = No.
+            # Rule 53-56: blank Loss Payee detail fields when Loss Payee? = No
+            # (legacy equipment schedule carried inline LP fields).
             lp_flag_key = _find_col(row, "loss payee?")
             if lp_flag_key and _is_no(row.get(lp_flag_key)):
                 for frag in ("loss payee name", "lp addr", "interest type"):
@@ -415,13 +413,46 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 
             kept.append(row)
 
-        return kept
+        # DF-IM-017: an insured may carry MULTIPLE equipment rows (up to 20).
+        # Counts are deterministic — guarantee the multi-row minimum per insured
+        # and cap at 20 instead of trusting the LLM to vary the row count.
+        return ensure_child_row_multiplicity(
+            kept,
+            min_per_tid=_EQUIP_PER_INSURED,
+            max_per_tid=_MAX_EQUIPMENT,
+            unique_frags=("serial number",),
+        )
+
+    def _fix_loss_payees(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Blank loss-payee detail when "Has Loss Payees? = No", then guarantee a
+        1–10 multi-row schedule per policy (DF-IM-018)."""
+        for row in rows:
+            flag_key = _find_col(row, "has loss payees") or _find_col(row, "loss payee?")
+            if flag_key and _is_no(row.get(flag_key)):
+                for frag in ("loss payee name", "street address", "city", "state",
+                             "zip", "equipment item", "interest type", "loan number"):
+                    k = _find_col(row, frag)
+                    if k:
+                        row[k] = ""
+        return ensure_child_row_multiplicity(
+            rows,
+            min_per_tid=_LOSSPAYEE_PER_INSURED,
+            max_per_tid=_MAX_LOSS_PAYEES,
+            unique_frags=("loan number",),
+            skip_predicate=lambda r: (
+                lambda fk: bool(fk) and _is_no(r.get(fk))
+            )(_find_col(r, "has loss payees") or _find_col(r, "loss payee?")),
+        )
 
     def _fix_misc_articles(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Coerce Total Value to numeric $0–$10k; blank it when coverage = No
         (Rule 59/60 / DF-IM-007)."""
         for row in rows:
-            sel_key = _find_col(row, "miscellaneous articles coverage")
+            # Legacy "Miscellaneous Articles Coverage" / numbered "Enable
+            # Miscellaneous Articles?" — both gate the total below.
+            sel_key = (_find_col(row, "miscellaneous articles coverage")
+                       or _find_col(row, "enable miscellaneous articles")
+                       or _find_col(row, "enable misc"))
             total_key = _find_col(row, "total value")
             if not total_key:
                 continue
@@ -533,14 +564,17 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 
         def _sheet(*frags: str) -> list[dict]:
             for name, data in previous_sheets_data.items():
-                nl = name.lower()
+                nl = _norm_sheet(name)
                 if all(f in nl for f in frags):
                     return data or []
             return []
 
-        equip_rows = _sheet("equipment schedule")
+        # New numbered template: 03_IM_Equipment + 05_IM_LossPayees (no Additional
+        # Interests / Loss History sheets). Legacy names still match via _norm_sheet.
+        equip_rows = _sheet("equipment")
         ai_rows = _sheet("additional interest")
-        loss_rows = _sheet("loss history")
+        lp_rows = _sheet("losspayee") or _sheet("loss payee")
+        loss_rows = _sheet("loss history") or _sheet("losshistory")
 
         def _count_by_tid(rows: list[dict], require_loss_amount: bool = False) -> dict[str, int]:
             counts: dict[str, int] = {}
@@ -558,6 +592,7 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 
         equip_count = _count_by_tid(equip_rows)
         ai_count = _count_by_tid(ai_rows)
+        lp_count = _count_by_tid(lp_rows)
         loss_count = _count_by_tid(loss_rows, require_loss_amount=True)
 
         def _hdr(*frags: str) -> str | None:
@@ -572,6 +607,7 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
         entity_key = _hdr("type of entity") or _hdr("entity")
         equip_key = _hdr("equipment", "count")
         ai_key = _hdr("additional interest", "count") or _hdr("additional", "count")
+        lp_key = _hdr("loss payee", "count") or _hdr("payee", "count")
         loss_key = _hdr("loss", "count")
 
         pi_state_key = _find_col(pi_rows[0], "binding state") or _find_col(pi_rows[0], "state")
@@ -591,6 +627,8 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
                 row[equip_key] = equip_count.get(tid, 0)
             if ai_key:
                 row[ai_key] = ai_count.get(tid, 0)
+            if lp_key:
+                row[lp_key] = lp_count.get(tid, 0)
             if loss_key:
                 row[loss_key] = loss_count.get(tid, 0)
             out.append(row)

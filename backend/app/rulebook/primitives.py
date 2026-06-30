@@ -10,9 +10,27 @@ Every formatter is idempotent on already-formatted input.
 """
 from __future__ import annotations
 
+import re
 import random
 from datetime import date, datetime
 from typing import Any, Sequence
+
+
+def normalize_sheet_name(name: str) -> str:
+    """Canonicalise a sheet name for type detection.
+
+    Newer SPG blank templates prefix sheets with an ordinal + LOB token and use
+    underscores (``01_Policy_Info``, ``03_IM_Equipment``, ``09_APD_LossPayees``)
+    where the older templates used plain spaced names (``Policy Info``, ``IM
+    LossPayees``). This strips a leading ``NN_`` ordinal and turns underscores
+    into spaces so a single set of substring checks matches both generations of
+    template. Idempotent on already-spaced names.
+    """
+    s = str(name or "").strip()
+    s = re.sub(r"^\s*\d+\s*[_\-\s]+", "", s)   # drop a leading "01_" / "10 - " ordinal
+    s = s.replace("_", " ")
+    s = re.sub(r"\s+", " ", s)
+    return s.strip().lower()
 
 
 def parse_date(val: Any) -> date | None:

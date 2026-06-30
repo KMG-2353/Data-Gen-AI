@@ -13,6 +13,7 @@ from app.rulebook.primitives import (
     format_date_slash as _format_mmddyyyy,
     add_one_year as _add_one_year,
     find_header_key as _find_header_key,
+    normalize_sheet_name as _normalize_sheet_name,
 )
 
 def _clean_response_text(text: str) -> str:
@@ -283,6 +284,9 @@ def detect_policy_type(filename: str) -> str:
         return "CARGO"
     if "_APD" in name or name.startswith("APD"):
         return "APD"
+    # SPG Wind/Hail rater (filename like "SPG_WH_...").
+    if "_WH" in name or name.startswith("WH"):
+        return "WH"
     # SPG Personal Lines raters. DW checked first so the combined HO_DW template
     # (which carries DF sheets too) routes to the Dwelling Fire handler.
     if "_DW" in name:
@@ -346,26 +350,51 @@ def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
     if rrg_spaced_hits >= 2:
         return "RRG"
 
+    # Normalised sheet names collapse the newer numbered/underscore templates
+    # ("01_Policy_Info", "03_IM_Equipment", "09_APD_LossPayees") onto the same
+    # spaced tokens the older templates used, so one set of checks matches both.
+    sheets_norm = [_normalize_sheet_name(s) for s in headers_by_sheet.keys()]
+
+    # SPG Wind/Hail rater: a Locations schedule keyed off a binding state derived
+    # from Location 1. Checked first — its WH-tokened sheets are distinctive.
+    wh_token = any("wh location" in s or s.startswith("wh ") for s in sheets_norm)
+    wh_header = any("auto from location" in h for h in all_headers_lower)
+    if wh_token or wh_header:
+        return "WH"
+
     # SPG commercial-auto raters (Cargo / APD): a commodities schedule plus
-    # power-unit/trailer schedules. Distinguished from IMS commercial-auto by the
-    # explicit Cargo/APD tokens and the commodities+units signature.
-    has_commodities = any("commodit" in s for s in sheets_lower)
-    has_trailers = any("trailer" in s for s in sheets_lower)
-    has_power_units = any("power unit" in s or "sched of power" in s for s in sheets_lower)
-    cargo_token = any("cargo" in s for s in sheets_lower) or any(
+    # power-unit/trailer schedules, or the explicit Cargo/APD sheet tokens used by
+    # the numbered templates ("03_APD_Drivers", "05_Cargo_Commodities").
+    has_commodities = any("commodit" in s for s in sheets_lower + sheets_norm)
+    has_trailers = any("trailer" in s for s in sheets_lower + sheets_norm)
+    has_power_units = any(
+        "power unit" in s or "sched of power" in s for s in sheets_lower + sheets_norm
+    )
+    cargo_token = any("cargo" in s for s in sheets_norm) or any(
         "motor truck cargo" in h for h in all_headers_lower
     )
-    apd_token = any("apd" in s or "auto physical damage" in s for s in sheets_lower)
-    if has_commodities and (apd_token or has_trailers) and not cargo_token:
+    apd_token = any(
+        "apd" in s or "auto physical damage" in s for s in sheets_norm
+    )
+    if apd_token:
         return "APD"
-    if cargo_token or (has_commodities and has_power_units):
+    if cargo_token:
+        return "CARGO"
+    if has_commodities and has_trailers:
+        return "APD"
+    if has_commodities and has_power_units:
         return "CARGO"
 
-    # IM (SPG Inland Marine rater): distinctive Equipment Schedule + Misc
-    # Articles + Loss History sheet combination, or the Scheduled Equipment
-    # Coverage policy header. Checked before GENERIC; IMS/RRG never match these.
-    has_equipment = any("equipment schedule" in s for s in sheets_lower)
-    has_misc_articles = any("misc articles" in s or "miscellaneous articles" in s for s in sheets_lower)
+    # IM (SPG Inland Marine rater): an Equipment + Misc Articles + Loss Payees
+    # signature, the numbered "IM Equipment" / "IM MiscArticles" tokens, or the
+    # legacy Scheduled Equipment Coverage header. Checked before GENERIC.
+    has_equipment = any(
+        "equipment schedule" in s or "im equipment" in s for s in sheets_lower + sheets_norm
+    )
+    has_misc_articles = any(
+        "misc articles" in s or "miscellaneous articles" in s or "im miscarticles" in s
+        for s in sheets_lower + sheets_norm
+    )
     has_sched_equip_header = any("scheduled equipment coverage" in h for h in all_headers_lower)
     if (has_equipment and has_misc_articles) or has_sched_equip_header:
         return "IM"
@@ -373,9 +402,9 @@ def detect_policy_type_from_headers(headers_by_sheet: dict) -> str:
     # SPG Personal Lines raters. Distinguished by their LOB-prefixed sheets:
     #   DW → "DF Policy" / "DF Locations";  HO → "HO Dwelling" / "HO Policy".
     # DW is checked first so a combined HO+DW workbook routes to the DW handler.
-    if any("df policy" in s or "df location" in s for s in sheets_lower):
+    if any("df policy" in s or "df location" in s for s in sheets_norm):
         return "DW"
-    if any("ho dwelling" in s or "ho policy" in s for s in sheets_lower):
+    if any("ho dwelling" in s or "ho policy" in s for s in sheets_norm):
         return "HO"
 
     return "GENERIC"

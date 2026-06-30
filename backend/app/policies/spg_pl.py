@@ -33,6 +33,14 @@ from app.rulebook.primitives import (
     spread_pick as _spread_pick,
     column_seed as _col_seed,
 )
+from app.rulebook.variety import ensure_child_row_multiplicity
+
+
+def _no_losses_5yr(row: dict) -> bool:
+    """True when a loss-history row declares no losses (so it must stay a single
+    blank row rather than being expanded to a multi-loss schedule)."""
+    k = _find_col(row, "losses in past 5 years") or _find_col(row, "any losses")
+    return bool(k) and _is_no(row.get(k))
 
 # ---------------------------------------------------------------------------
 # Approved dropdown values — sourced verbatim from the rater template's
@@ -353,16 +361,27 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
         if st == "uw_history":
             rows = self._fix_uw_history(rows)
         elif st == "property":
+            # DEF-007: DW carries MULTIPLE locations per insured (up to 20);
+            # counts are deterministic, so guarantee the minimum and cap the max.
+            # HO Dwelling is single-row per insured (_property_max is None).
             if self._property_max:
-                rows = self._cap_per_tid(rows, self._property_max)
+                rows = ensure_child_row_multiplicity(
+                    rows, min_per_tid=_LOCATIONS_PER_INSURED, max_per_tid=self._property_max)
             rows = self._fix_property(rows)
         elif st == "coverages":
             rows = self._fix_coverages(rows)
         elif st == "loss_payees":
-            rows = self._cap_per_tid(rows, _MAX_LOSS_PAYEES)
+            # DEF-009 / HO-010: 1–10 loss payees per policy, multiple.
+            rows = ensure_child_row_multiplicity(
+                rows, min_per_tid=_LOSS_PAYEES_PER_INSURED, max_per_tid=_MAX_LOSS_PAYEES,
+                unique_frags=("loan number",))
             rows = self._fix_loss_payees(rows)
         elif st == "loss_history":
-            rows = self._cap_per_tid(rows, _MAX_LOSS_HISTORY)
+            # DEF-010 / HO-012: a loss policy carries a multi-row schedule (1–10);
+            # no-loss policies stay a single blank row.
+            rows = ensure_child_row_multiplicity(
+                rows, min_per_tid=_LOSS_HISTORY_PER_INSURED, max_per_tid=_MAX_LOSS_HISTORY,
+                skip_predicate=_no_losses_5yr)
             rows = self._fix_loss_history(rows, previous_sheets_data)
         return _normalize_common(rows)
 
@@ -505,7 +524,18 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
         return rows
 
     def _fix_loss_payees(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Mortgagee dependency (Rule 119-121/139-141)."""
+        """Mortgagee dependency (Rule 119-121/139-141).
+
+        HO-020: "Is Mortgagee?" is always generated as "Yes" — deterministically
+        fan it across Yes/No so both branches are exercised, then enforce the
+        dependency (No → Loan Number / Mortgage Current blank).
+        """
+        mort_col0 = (_find_col(rows[0], "is mortgagee") or _find_col(rows[0], "mortgagee")) if rows else None
+        if mort_col0:
+            mort_seed = _col_seed(mort_col0)
+            for i, row in enumerate(rows):
+                row[mort_col0] = _spread_pick(i, ("Yes", "No"), seed=mort_seed)
+
         for row in rows:
             mort_key = _find_col(row, "is mortgagee") or _find_col(row, "mortgagee")
             if mort_key and _is_no(row.get(mort_key)):
@@ -692,6 +722,16 @@ SPG DW — DF COVERAGES RULES (HARD CONSTRAINTS):
 """
 
     def _fix_property(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # DEF-016: ">2 Acres?" is always generated as "No". Deterministically vary
+        # it (~1 in 3 → Yes) so both values are exercised; the >10 Acres dependency
+        # below stays consistent for the No rows.
+        # Column is "> 2 Acres?" (spaced) — match on the space-tolerant "2 acres".
+        acre_col = _find_col(rows[0], "2 acres") if rows else None
+        if acre_col:
+            acre_seed = _col_seed(acre_col)
+            for i, row in enumerate(rows):
+                row[acre_col] = _spread_pick(i, ("No", "No", "Yes"), seed=acre_seed)
+
         for row in rows:
             # Exclude Cov B? = Yes → Coverage B Value blank. [Rule 115]
             excl_key = _find_col(row, "exclude cov b")
@@ -717,9 +757,9 @@ SPG DW — DF COVERAGES RULES (HARD CONSTRAINTS):
                 _blank_fields(row, "wbs primary")
 
             # >2 Acres? = No → >10 Acres? blank. [Rule 123]
-            acre_key = _find_col(row, ">2 acres")
+            acre_key = _find_col(row, "2 acres")
             if acre_key and _is_no(row.get(acre_key)):
-                _blank_fields(row, ">10 acres")
+                _blank_fields(row, "10 acres")
 
             # New Purchase? = No → Year Purchased / Purchase Price blank. [Rule 127-128]
             np_key = _find_col(row, "new purchase")
@@ -825,6 +865,22 @@ SPG HO — HO COVERAGES RULES (HARD CONSTRAINTS):
                     sqft = _to_number(row.get(sqft_key))
                     if sqft is None or sqft < _MANUFACTURED_MIN_SQFT:
                         row[sqft_key] = _MANUFACTURED_MIN_SQFT
+
+        # HO-018: "Located on More Than 2 Acres?" is always "No" — vary it (~1 in 3
+        # → Yes); the >10 Acres dependency below blanks the No rows.
+        acre_key0 = _find_col(rows[0], "more than 2 acres") if rows else None
+        if acre_key0:
+            acre_seed = _col_seed(acre_key0)
+            for i, row in enumerate(rows):
+                row[acre_key0] = _spread_pick(i, ("No", "No", "Yes"), seed=acre_seed)
+
+        # HO-019: "Number of Golf Carts" is always 0 — fan it across 0/1/2/3 so
+        # non-zero values are exercised where golf carts are present.
+        golf_key = _find_col(rows[0], "golf cart") if rows else None
+        if golf_key:
+            golf_seed = _col_seed(golf_key)
+            for i, row in enumerate(rows):
+                row[golf_key] = _spread_pick(i, (0, 0, 1, 2, 3), seed=golf_seed)
 
         for row in rows:
             # Wood stove not present → primary-heating answer blank. [Rule 90]
