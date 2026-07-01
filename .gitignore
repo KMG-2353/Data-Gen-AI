@@ -6,7 +6,7 @@ CLAUDE.md
 *.pptx
 .obsidian
 
-
+*.xlsx
 
 # Ignore Smart Environment folder
 .smart-env

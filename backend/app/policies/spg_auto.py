@@ -228,9 +228,11 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                 "trailers": ("vin number",),
                 "commodities": (),
             }[st]
+            # APD-014: vary the per-insured count so schedules don't follow a
+            # fixed "always N" / "2-2-1" pattern across policies.
             return ensure_child_row_multiplicity(
                 rows, min_per_tid=self._CHILD_TARGETS[st], max_per_tid=_UNIT_MAX,
-                unique_frags=unique,
+                unique_frags=unique, vary_key=f"{self.policy_type}:{st}",
             )
         if st == "loss_payees":
             return self._fix_loss_payees(rows)
@@ -294,7 +296,7 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                         row[k] = ""
         return ensure_child_row_multiplicity(
             rows, min_per_tid=_LOSS_PAYEES_PER_INSURED, max_per_tid=_MAX_LOSS_PAYEES,
-            skip_predicate=self._no_loss_payees,
+            skip_predicate=self._no_loss_payees, vary_key=f"{self.policy_type}:loss_payees",
         )
 
     @staticmethod
@@ -315,7 +317,7 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                         row[k] = ""
         return ensure_child_row_multiplicity(
             rows, min_per_tid=_LOSS_HISTORY_PER_INSURED, max_per_tid=_MAX_LOSS_HISTORY,
-            skip_predicate=self._no_losses,
+            skip_predicate=self._no_losses, vary_key=f"{self.policy_type}:loss_history",
         )
 
     @staticmethod

@@ -100,3 +100,69 @@ def test_full_pool_is_exercised_over_enough_rows():
     seen = {r["State"] for r in rows}
     # With one column and N>=len rows the spread covers the whole pool.
     assert seen == set(US_STATES)
+
+
+# ---------------------------------------------------------------------------
+# City/State/ZIP correspondence (Class B):
+# DEF-024 / HO-023 / CARGO-007 / WH-004 / IM generic / APD-015
+# ---------------------------------------------------------------------------
+from app.rulebook.geo import STATE_GEO
+
+_ZIP_TO_STATE = {z: st for st, pairs in STATE_GEO.items() for _c, z in pairs}
+_CITYZIP_TO_STATE = {(c, z): st for st, pairs in STATE_GEO.items() for c, z in pairs}
+
+
+def _addr_rows(n=8):
+    return [
+        {"Address – City": "OldCity", "Address – State": "VA", "Address – Zip": "00000",
+         "Mailing City": "MOld", "Mailing State": "VA", "Mailing Zip": "99999",
+         "Binding State": "VA"}
+        for _ in range(n)
+    ]
+
+
+def test_zip_matches_assigned_state():
+    rows = _addr_rows()
+    spread_address_states(rows)
+    for r in rows:
+        assert _ZIP_TO_STATE[r["Address – Zip"]] == r["Address – State"]
+        assert _ZIP_TO_STATE[r["Mailing Zip"]] == r["Mailing State"]
+
+
+def test_city_state_zip_triple_is_real():
+    rows = _addr_rows()
+    spread_address_states(rows)
+    for r in rows:
+        assert (r["Address – City"], r["Address – Zip"]) in _CITYZIP_TO_STATE
+        assert _CITYZIP_TO_STATE[(r["Address – City"], r["Address – Zip"])] == r["Address – State"]
+
+
+def test_state_selection_keeps_zip_consistent():
+    rows = _addr_rows()
+    spread_address_states(rows, state_selection=["TX", "FL"])
+    for r in rows:
+        assert r["Address – State"] in {"TX", "FL"}
+        assert _ZIP_TO_STATE[r["Address – Zip"]] == r["Address – State"]
+
+
+def test_address_consistency_is_idempotent():
+    rows = _addr_rows()
+    spread_address_states(rows)
+    snapshot = copy.deepcopy(rows)
+    spread_address_states(rows)
+    assert rows == snapshot
+
+
+def test_blank_block_city_zip_preserved():
+    # A dependency-blanked mailing block (State blank) leaves City/Zip untouched.
+    rows = [{"Address – City": "C", "Address – State": "VA", "Address – Zip": "00000",
+             "Mailing City": "", "Mailing State": "", "Mailing Zip": "",
+             "Binding State": "VA"}]
+    spread_address_states(rows)
+    assert rows[0]["Mailing City"] == "" and rows[0]["Mailing Zip"] == ""
+
+
+def test_every_state_has_geo():
+    # Every state in the spread pool must have a consistent geo triple available.
+    for st in US_STATES:
+        assert STATE_GEO.get(st), f"missing geo for {st}"

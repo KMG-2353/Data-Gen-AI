@@ -328,16 +328,33 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 
     @staticmethod
     def _reconcile_override_reason(row: dict[str, Any]) -> None:
-        """Keep Override Reason consistent with Fee Override (DF-IM-009).
+        """Keep Override Reason consistent with the override fields (DF-IM-009 /
+        DF-IM-019).
 
-        The reason is meaningful only when an override amount exists. No-ops when
-        the template carries neither column.
+        The reason is mandatory whenever **any** override-type field carries a
+        value — the template has several (UW Surcharge %, UW Credit %, Equipment /
+        Misc / Deductible / Fee Override, …), not just Fee Override — and must be
+        blank when none do. No-ops when the template carries no Override Reason.
         """
         reason_key = _find_col(row, "override reason")
-        fee_key = _find_col(row, "fee override") or _find_col(row, "override amount")
-        if not reason_key or not fee_key:
+        if not reason_key:
             return
-        has_override = str(row.get(fee_key) or "").strip() not in ("", "0", "0.0")
+        # Every override-type driver of the reason: any "override" column (except
+        # the reason itself) plus the UW surcharge/credit adjustments.
+        driver_keys = [
+            k for k in row
+            if k != reason_key and (
+                "override" in k.lower()
+                or "surcharge" in k.lower()
+                or "credit" in k.lower()
+            )
+        ]
+        if not driver_keys:
+            return
+        has_override = any(
+            str(row.get(k) or "").strip() not in ("", "0", "0.0", "0%", "0.00", "$0")
+            for k in driver_keys
+        )
         if not has_override:
             row[reason_key] = ""
         elif not str(row.get(reason_key) or "").strip():

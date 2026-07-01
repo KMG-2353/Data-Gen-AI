@@ -200,9 +200,13 @@ def _enforce_effective_expiration_date_range(
             # Reuse the date already generated for this test-case group
             effective_dt = tc_group_dates[tc_group]
         else:
-            # Generate a new date and cache it for this test-case group
+            # Generate a new date and cache it for this test-case group.
+            # Default (no explicit date instruction): keep the effective date on
+            # or after today so it never precedes the Quote Date (data-creation
+            # date == today) — coverage cannot begin before the quote is created.
+            # [DF-IM-020 / DEF-023 / HO-022 / CARGO-006 / WH-003 / APD-013]
             if not year_range and not _has_date_intent(special_instruction):
-                offset = random.randint(-60, 60)
+                offset = random.randint(0, 60)
                 effective_dt = today + timedelta(days=offset)
             elif year_range:
                 start_year, end_year = year_range
@@ -214,7 +218,7 @@ def _enforce_effective_expiration_date_range(
                 effective_day = random.randint(1, 28)
                 effective_dt = date(effective_year, effective_month, effective_day)
             else:
-                offset = random.randint(-60, 60)
+                offset = random.randint(0, 60)
                 effective_dt = today + timedelta(days=offset)
 
             tc_group_dates[tc_group] = effective_dt

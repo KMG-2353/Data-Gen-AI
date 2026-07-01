@@ -26,10 +26,10 @@ from app.policies import get_handler
 from app.policies.im import ImHandler
 from app.policies.spg_auto import ApdHandler, CargoHandler, _AUTO_ENTITY_TYPES, _AUTO_COMPANY_TYPES
 from app.policies.spg_wh import WhHandler, _WH_ENTITY_TYPES
-from app.policies.spg_pl import DwHandler, HoHandler
+from app.policies.spg_pl import DwHandler, HoHandler, _PL_ENTITY_TYPES
 from app.policies.im import _IM_ENTITY_TYPES
 from app.rulebook.variety import enforce_variety_fields
-from app.rulebook.primitives import is_us_state
+from app.rulebook.primitives import is_us_state, parse_date as _parse_date
 
 
 @pytest.fixture(autouse=True)
@@ -326,3 +326,178 @@ def test_ho_mortgagee_varies():
     for r in out:
         if str(r["Is Mortgagee?"]).lower() == "no":
             assert r["Loan Number"] == ""               # dependency enforced
+
+
+# ---------------------------------------------------------------------------
+# Class A — Effective Date >= Quote Date (coverage cannot begin before the
+# quote is created).  DF-IM-020 / DEF-023 / HO-022 / CARGO-006 / WH-003 / APD-013
+# ---------------------------------------------------------------------------
+import datetime as _dt
+
+
+def _eff_ge_quote(row):
+    eff = _parse_date(row.get("Effective Date") or row.get("effective date"))
+    quote = _parse_date(row.get("Quote Date") or row.get("Date of Quote"))
+    assert eff is not None and quote is not None
+    assert eff >= quote, f"effective {eff} < quote {quote}"
+
+
+def test_im_effective_on_or_after_quote():
+    # DF-IM-020: LLM emitted an effective date earlier than the quote date.
+    handler = ImHandler()
+    rows = [{"Test ID": "x", "Type of Entity": "Corporation",
+             "Effective Date": "05/22/2026", "Quote Date": "05/31/2026"} for _ in range(4)]
+    out = handler.post_process(rows, "01_Policy_Info", "")
+    for r in out:
+        _eff_ge_quote(r)
+
+
+def test_wh_effective_on_or_after_quote():
+    # WH-003
+    handler = WhHandler()
+    rows = [{"Test ID": "x", "Type of Entity": "Corporation",
+             "Effective Date": "05/22/2026", "Quote Date": "05/31/2026"} for _ in range(4)]
+    out = handler.post_process(rows, "01_Policy_Info", "")
+    for r in out:
+        _eff_ge_quote(r)
+
+
+def test_cargo_effective_on_or_after_quote():
+    # CARGO-006
+    handler = CargoHandler()
+    rows = [{"Test ID": "x", "Type of Entity": "Corporation",
+             "Effective Date": "05/22/2026", "Quote Date": "05/31/2026"} for _ in range(4)]
+    out = handler.post_process(rows, "01_Policy_Info", "")
+    for r in out:
+        _eff_ge_quote(r)
+
+
+def test_apd_effective_on_or_after_quote():
+    # APD-013
+    handler = ApdHandler()
+    rows = [{"Test ID": "x", "Type of Entity": "Corporation",
+             "Effective Date": "05/22/2026", "Quote Date": "05/31/2026"} for _ in range(4)]
+    out = handler.post_process(rows, "01_Policy_Info", "")
+    for r in out:
+        _eff_ge_quote(r)
+
+
+def test_dw_effective_clamped_to_today_not_before_quote():
+    # DEF-023: quote is pinned to today; a past effective date must be pushed up
+    # to today so it never precedes the quote.
+    handler = DwHandler()
+    rows = [{"Test ID": "TS-001", "Product Selected": "Dwelling Fire DP-3",
+             "Effective Date": "01/01/2020", "Expiration Date": "",
+             "Quote Date": "01/01/2020"}]
+    out = handler.post_process(rows, "Policy Info", "")
+    today = _dt.date.today()
+    assert _parse_date(out[0]["Quote Date"]) == today
+    assert _parse_date(out[0]["Effective Date"]) == today
+    _eff_ge_quote(out[0])
+    # Expiration re-derived from the clamped effective date (today + 1 year).
+    assert _parse_date(out[0]["Expiration Date"]) == today.replace(year=today.year + 1)
+
+
+def test_ho_effective_clamped_to_today_not_before_quote():
+    # HO-022
+    handler = HoHandler()
+    rows = [{"Test ID": "TS-001", "Product Selected": "HO-3 Homeowners",
+             "Effective Date": "03/15/2019", "Expiration Date": "",
+             "Quote Date": "03/15/2019"}]
+    out = handler.post_process(rows, "Policy Info", "")
+    today = _dt.date.today()
+    assert _parse_date(out[0]["Quote Date"]) == today
+    assert _parse_date(out[0]["Effective Date"]) == today
+    _eff_ge_quote(out[0])
+
+
+def test_dw_future_effective_preserved():
+    # Guard: a valid future effective date (>= today) is NOT altered.
+    handler = DwHandler()
+    future = _dt.date.today() + _dt.timedelta(days=45)
+    fstr = future.strftime("%m/%d/%Y")
+    rows = [{"Test ID": "TS-001", "Product Selected": "Dwelling Fire DP-3",
+             "Effective Date": fstr, "Expiration Date": "", "Quote Date": fstr}]
+    out = handler.post_process(rows, "Policy Info", "")
+    assert _parse_date(out[0]["Effective Date"]) == future
+
+
+# ---------------------------------------------------------------------------
+# Per-LOB open defects (2026-06-30/07-01 tracker)
+# ---------------------------------------------------------------------------
+
+def test_im_override_reason_gated_on_any_override():
+    # DF-IM-019: Override Reason is mandatory when ANY override field has a value
+    # (not just Fee Override), and blank when none do.
+    handler = ImHandler()
+    rows = [
+        # UW Surcharge % present, Fee Override blank -> reason must be populated
+        {"Test ID": "x", "UW Surcharge %": "5%", "Fee Override ($)": "",
+         "Deductible Override ($)": "", "Override Reason": ""},
+        # every override blank -> reason must be cleared
+        {"Test ID": "x", "UW Surcharge %": "", "Fee Override ($)": "",
+         "Deductible Override ($)": "", "Override Reason": "stray"},
+        # a non-fee override present -> reason populated
+        {"Test ID": "x", "UW Surcharge %": "", "Fee Override ($)": "",
+         "Deductible Override ($)": "250", "Override Reason": ""},
+    ]
+    out = handler.post_process(rows, "01_Policy_Info", "")
+    assert out[0]["Override Reason"].strip()      # surcharge present
+    assert out[1]["Override Reason"] == ""         # nothing present
+    assert out[2]["Override Reason"].strip()      # deductible override present
+
+
+def test_dw_loc_number_sequential_per_insured():
+    # DEF-021: "Loc #" must run 1..N within each insured on DF Locations.
+    handler = DwHandler()
+    rows = [{"Test ID": "TS-001", "Loc #": 7, "Street Address": "1 A", "City": "X",
+             "State": "VA", "ZIP Code": "00000"}]
+    prev = {"Policy Info": [{"Test ID": "TS-001"}]}
+    out = handler.post_process(rows, "DF Locations", "", prev)
+    locs = [r["Loc #"] for r in out]
+    assert locs == list(range(1, len(out) + 1))    # sequential from 1
+
+
+def test_ho_type_of_entity_varies():
+    # HO-021: Type of Entity collapses onto "Individual" for every row.
+    handler = HoHandler()
+    rows = [{"Test ID": f"TS-00{i}", "Product Selected": "HO-3 Homeowners",
+             "Type of Entity": "Individual", "Effective Date": "", "Quote Date": ""}
+            for i in range(1, 8)]
+    out = handler.post_process(rows, "Policy Info", "")
+    seen = {r["Type of Entity"] for r in out}
+    assert len(seen) >= 4
+    assert seen <= set(_PL_ENTITY_TYPES)
+
+
+def test_dw_type_of_entity_varies():
+    handler = DwHandler()
+    rows = [{"Test ID": f"TS-00{i}", "Product Selected": "Dwelling Fire DP-3",
+             "Type of Entity": "Individual", "Effective Date": "", "Quote Date": ""}
+            for i in range(1, 8)]
+    out = handler.post_process(rows, "Policy Info", "")
+    assert len({r["Type of Entity"] for r in out}) >= 4
+
+
+def test_apd_child_counts_vary_across_insureds():
+    # APD-014: per-insured schedule counts must not follow a fixed pattern.
+    handler = ApdHandler()
+    prev = {"01_Policy_Info": [{"Test ID": f"TS-0{i:02d}"} for i in range(1, 9)]}
+    rows = [{"Test ID": f"TS-0{i:02d}", "License Number": f"L{i}"} for i in range(1, 9)]
+    out = handler.post_process(rows, "03_APD_Drivers", "", prev)
+    counts = Counter(r["Test ID"] for r in out)
+    assert all(c >= 2 for c in counts.values())     # still multi-row (>= min)
+    assert len(set(counts.values())) > 1            # not a single fixed count
+
+
+def test_cargo_child_counts_vary_across_insureds():
+    # CARGO-008: Cargo schedule counts must be randomised per policy, not a fixed
+    # pattern. Shares the auto handler's varied-multiplicity path.
+    handler = CargoHandler()
+    prev = {"01_Policy_Info": [{"Test ID": f"TS-0{i:02d}"} for i in range(1, 9)]}
+    rows = [{"Test ID": f"TS-0{i:02d}", "Commodity (Select from list)": "Steel"}
+            for i in range(1, 9)]
+    out = handler.post_process(rows, "05_Cargo_Commodities", "", prev)
+    counts = Counter(r["Test ID"] for r in out)
+    assert all(c >= 1 for c in counts.values())
+    assert len(set(counts.values())) > 1            # not a single fixed count

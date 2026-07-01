@@ -89,6 +89,14 @@ _LOSS_HISTORY_PER_INSURED = 3
 _HO_COVERAGE_F = ("$1,000", "$5,000", "$10,000")
 _HO_COVERAGE_F_DEFAULT = "$1,000"
 
+# Type of Entity dropdown (Rule 23) — the LLM collapses this onto "Individual" for
+# every personal-lines row (HO-021). Fan it across the full dropdown so all seven
+# options are exercised. Order matches the DW/HO rater's Type of Entity validation.
+_PL_ENTITY_TYPES = (
+    "Individual", "Corporation", "LLC", "Partnership",
+    "Joint Venture", "Estate", "Trust",
+)
+
 # "Is Dwelling a Manufactured Home?" must exercise BOTH values, not always "No"
 # (HO-017). A manufactured dwelling needs ≥ 1,344 sq ft (Rule 73), enforced on
 # the same sheet when a row is varied to Yes.
@@ -408,10 +416,17 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
 
     def _fix_policy_info(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Stamp the default TS-## Test IDs and enforce Policy Info dependencies."""
+        # HO-021: the LLM collapses "Type of Entity" onto "Individual". Fan it
+        # across the full dropdown so every option is exercised.
+        entity_key = _find_col(rows[0], "type of entity") if rows else None
+        ent_seed = _col_seed(entity_key or "type of entity")
         for idx, row in enumerate(rows):
             tk = _tid_key(row)
             if tk is not None:
                 row[tk] = format_test_case_id(idx + 1)
+
+            if entity_key:
+                row[entity_key] = _spread_pick(idx, _PL_ENTITY_TYPES, seed=ent_seed)
 
             # Product Selected is pinned per LOB: DW -> "Dwelling Fire DP-3",
             # HO -> "HO-3 Homeowners". No other dropdown value is permitted.
@@ -420,19 +435,29 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             if prod_key:
                 row[prod_key] = self._product_default
 
-            # Expiration = Effective + 1 year. [Rule 4/5]
+            # Quote Date must be the data-creation date (today): never a past or
+            # future date. [DEF-002 / HO-002]
             eff_key = _find_col(row, "effective date")
             exp_key = _find_col(row, "expiration date")
             quote_key = _find_col(row, "quote date")
             eff = _parse_date(row.get(eff_key)) if eff_key else None
+
+            # DEF-023 / HO-022: the Effective Date must be on or after the Quote
+            # Date (today) — coverage cannot begin before the quote is created.
+            # Quote is pinned to today, so clamp any earlier effective date up to
+            # today before deriving the expiration from it.
+            if eff and eff < date.today():
+                eff = date.today()
+                if eff_key:
+                    row[eff_key] = _fmt_date(eff)
+
+            # Expiration = Effective + 1 year. [Rule 4/5]
             if eff and exp_key:
                 try:
                     row[exp_key] = _fmt_date(eff.replace(year=eff.year + 1))
                 except ValueError:  # Feb 29
                     row[exp_key] = _fmt_date(eff + timedelta(days=365))
 
-            # Quote Date must be the data-creation date (today): never a past or
-            # future date. [DEF-002 / HO-002]
             if quote_key:
                 row[quote_key] = _fmt_date(date.today())
 
@@ -722,6 +747,17 @@ SPG DW — DF COVERAGES RULES (HARD CONSTRAINTS):
 """
 
     def _fix_property(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # DEF-021: "Loc #" must run sequentially (1..N) within each insured, like
+        # the DF Loss Payees "#" column. Rows arrive grouped by Test ID (from
+        # ensure_child_row_multiplicity), so renumber per Test-ID group.
+        loc_key = next((k for k in rows[0] if k.strip().lower() == "loc #"), None) if rows else None
+        if loc_key:
+            counters: dict[str, int] = {}
+            for row in rows:
+                t = _tid(row)
+                counters[t] = counters.get(t, 0) + 1
+                row[loc_key] = counters[t]
+
         # DEF-016: ">2 Acres?" is always generated as "No". Deterministically vary
         # it (~1 in 3 → Yes) so both values are exercised; the >10 Acres dependency
         # below stays consistent for the No rows.

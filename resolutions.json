@@ -1,0 +1,236 @@
+{
+  "lob": "SPG All LOBs (IM / DW / HO / Cargo / WH / APD)",
+  "sheet": "Defect Tracker (2)",
+  "resolutions": [
+    {
+      "defect_id": "DF-IM-020",
+      "module": "IM / Policy info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date in some records; must be same as or later than Quote Date (coverage cannot begin before the quote is created).",
+      "verdict": "Fixed",
+      "root_cause": "Shared date hook generated effective dates with offset randint(-60,60) — up to 60 days in the past — while the handler pins Quote Date. The IM quote<=effective clamp already keeps effective>=quote; the hook offset made past-dated effectives possible.",
+      "fix": "llm_service._enforce_effective_expiration_date_range: default offsets changed from randint(-60,60) to randint(0,60) so effective is never before today. IM handler retains quote<=effective clamp (im.py _fix_policy).",
+      "test": "test_new_template_defects.py::test_im_effective_on_or_after_quote"
+    },
+    {
+      "defect_id": "DEF-023",
+      "module": "DW / Policy Info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date; must be >= Quote Date.",
+      "verdict": "Fixed",
+      "root_cause": "DW/HO pin Quote Date to today but never clamped a past effective date forward, so an effective date the LLM/hook produced before today preceded the quote.",
+      "fix": "spg_pl._fix_policy_info: clamp effective up to today when earlier, then derive Expiration from the clamped date (before pinning Quote Date = today). Reinforced by the shared hook floor-at-today.",
+      "test": "test_new_template_defects.py::test_dw_effective_clamped_to_today_not_before_quote, test_dw_future_effective_preserved"
+    },
+    {
+      "defect_id": "HO-022",
+      "module": "HO / Policy_Info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date; must be >= Quote Date.",
+      "verdict": "Fixed",
+      "root_cause": "Same as DEF-023 (shared spg_pl base for DW+HO).",
+      "fix": "spg_pl._fix_policy_info effective>=today clamp.",
+      "test": "test_new_template_defects.py::test_ho_effective_clamped_to_today_not_before_quote"
+    },
+    {
+      "defect_id": "CARGO-006",
+      "module": "Cargo / Policy info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date; must be >= Quote Date.",
+      "verdict": "Fixed",
+      "root_cause": "Shared date-hook past offset; auto handler already clamps quote<=effective.",
+      "fix": "Shared hook floor-at-today (llm_service); auto handler quote<=effective clamp (spg_auto._fix_policy).",
+      "test": "test_new_template_defects.py::test_cargo_effective_on_or_after_quote"
+    },
+    {
+      "defect_id": "WH-003",
+      "module": "WH / Policy info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date; must be >= Quote Date.",
+      "verdict": "Fixed",
+      "root_cause": "Shared date-hook past offset; WH handler already clamps quote<=effective.",
+      "fix": "Shared hook floor-at-today; WH handler quote<=effective clamp (spg_wh._fix_policy).",
+      "test": "test_new_template_defects.py::test_wh_effective_on_or_after_quote"
+    },
+    {
+      "defect_id": "APD-013",
+      "module": "APD / Policy info",
+      "field": "Effective Date",
+      "summary": "Effective Date earlier than Quote Date; must be >= Quote Date.",
+      "verdict": "Fixed",
+      "root_cause": "Shared date-hook past offset; auto handler already clamps quote<=effective.",
+      "fix": "Shared hook floor-at-today; auto handler quote<=effective clamp.",
+      "test": "test_new_template_defects.py::test_apd_effective_on_or_after_quote"
+    },
+    {
+      "defect_id": "DF-IM-(generic)",
+      "module": "IM / Policy info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Invalid address combinations: valid ZIP but belonging to a different state than the City/State in the row.",
+      "verdict": "Fixed",
+      "root_cause": "The universal state-variety pass (spread_address_states) fanned the State column across the pool for variety but left City and ZIP as the LLM produced them for the original state, so after the spread the triple no longer corresponded.",
+      "fix": "New rulebook/geo.py (real City/ZIP per state, single source). variety.spread_address_states rewritten to group City/State/ZIP into address blocks and assign a consistent (state, city, zip) triple per block from STATE_GEO. Binding state untouched; blanks preserved.",
+      "test": "tests/rulebook/test_variety.py::test_zip_matches_assigned_state, test_city_state_zip_triple_is_real, test_state_selection_keeps_zip_consistent"
+    },
+    {
+      "defect_id": "DEF-024",
+      "module": "DW / Policy Info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Valid ZIP under a mismatched state; City/State/ZIP do not correspond.",
+      "verdict": "Fixed",
+      "root_cause": "Same structural cause as the IM generic address defect.",
+      "fix": "variety.spread_address_states block-consistent triples (Agency/Insured/Mailing address blocks).",
+      "test": "tests/rulebook/test_variety.py::test_zip_matches_assigned_state (+ real-header verification)"
+    },
+    {
+      "defect_id": "HO-023",
+      "module": "HO / Policy_Info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Valid ZIP under a mismatched state; City/State/ZIP do not correspond.",
+      "verdict": "Fixed",
+      "root_cause": "Same structural cause.",
+      "fix": "variety.spread_address_states block-consistent triples.",
+      "test": "tests/rulebook/test_variety.py::test_city_state_zip_triple_is_real"
+    },
+    {
+      "defect_id": "CARGO-007",
+      "module": "Cargo / Policy info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Valid ZIP under a mismatched state; City/State/ZIP do not correspond.",
+      "verdict": "Fixed",
+      "root_cause": "Same structural cause.",
+      "fix": "variety.spread_address_states block-consistent triples.",
+      "test": "tests/rulebook/test_variety.py::test_zip_matches_assigned_state"
+    },
+    {
+      "defect_id": "WH-004",
+      "module": "WH / Policy info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Valid ZIP under a mismatched state; City/State/ZIP do not correspond.",
+      "verdict": "Fixed",
+      "root_cause": "Same structural cause.",
+      "fix": "variety.spread_address_states block-consistent triples.",
+      "test": "tests/rulebook/test_variety.py::test_zip_matches_assigned_state"
+    },
+    {
+      "defect_id": "APD-015",
+      "module": "APD / Policy Info",
+      "field": "Generic (City/State/ZIP)",
+      "summary": "Valid ZIP under a mismatched state; City/State/ZIP do not correspond.",
+      "verdict": "Fixed",
+      "root_cause": "Same structural cause.",
+      "fix": "variety.spread_address_states block-consistent triples.",
+      "test": "tests/rulebook/test_variety.py::test_zip_matches_assigned_state"
+    },
+    {
+      "defect_id": "DF-IM-019",
+      "module": "IM / Policy info",
+      "field": "Override Reason",
+      "summary": "Override Reason is mandatory whenever any override field has a value, but the LLM leaves it blank in some data.",
+      "verdict": "Fixed",
+      "root_cause": "_reconcile_override_reason only checked 'Fee Override', so when another override driver (UW Surcharge/Credit %, Equipment/Misc/Deductible Rate Override) held a value but Fee Override was blank, the reason was wrongly cleared/left blank.",
+      "fix": "im._reconcile_override_reason generalized to gate on ANY override-type column (name contains 'override' plus surcharge/credit), populating a default reason when any is present and blanking when none are.",
+      "test": "test_new_template_defects.py::test_im_override_reason_gated_on_any_override"
+    },
+    {
+      "defect_id": "DEF-021",
+      "module": "DW / DF Locations",
+      "field": "Loc #",
+      "summary": "Loc # not sequential per insured; should run in order like DF Loss Payees.",
+      "verdict": "Fixed",
+      "root_cause": "ensure_child_row_multiplicity only re-sequences the literal '#' column; DF Locations uses 'Loc #', which was never renumbered after expansion.",
+      "fix": "spg_pl DwHandler._fix_property renumbers 'Loc #' 1..N within each Test-ID group.",
+      "test": "test_new_template_defects.py::test_dw_loc_number_sequential_per_insured"
+    },
+    {
+      "defect_id": "DEF-022",
+      "module": "DW / DF Loss Payees",
+      "field": "(rows)",
+      "summary": "If 'Any Losses in Past 5 Years?' = No, only a single loss-payee record should be generated; multiple duplicate rows are produced.",
+      "verdict": "Rule Book Issue",
+      "root_cause": "The DF Loss Payees sheet has no 'Any Losses in Past 5 Years?' column — that field lives only on DF Loss History. Loss payees are gated on 'Is Mortgagee?' (Rule 119-121), not on losses, and the ruleset (DEF-009) requires 1-10 payees. The 'single row when no losses' behaviour QA describes already exists on the correct sheet (DF Loss History) via the _no_losses_5yr skip predicate.",
+      "fix": "No code change: gating loss payees on 'Any Losses' has no basis in the template. DF Loss History already emits a single blank row for no-loss insureds.",
+      "test": "n/a (existing loss-history behaviour; DEF-010 coverage in test_dw_defects.py)"
+    },
+    {
+      "defect_id": "HO-021",
+      "module": "HO / Policy_Info",
+      "field": "Type of Entity",
+      "summary": "Type of Entity selects only 'Individual' for all rows though the dropdown has more options.",
+      "verdict": "Fixed",
+      "root_cause": "The personal-lines policy-info fixer never fanned Type of Entity (unlike IM/WH/Cargo/APD), so it collapsed onto the LLM's single value.",
+      "fix": "spg_pl._fix_policy_info now spreads Type of Entity across the full dropdown (_PL_ENTITY_TYPES) for DW and HO.",
+      "test": "test_new_template_defects.py::test_ho_type_of_entity_varies, test_dw_type_of_entity_varies"
+    },
+    {
+      "defect_id": "CARGO-008",
+      "module": "Cargo / (child schedules)",
+      "field": "Record counts",
+      "summary": "Record counts follow a fixed pattern (always 3, or 2-2-1) across policies; counts should be generated randomly.",
+      "verdict": "Fixed",
+      "root_cause": "ensure_child_row_multiplicity always expanded each group to exactly min_per_tid, producing an identical count for every insured.",
+      "fix": "Added deterministic per-(schedule, insured) count variation (vary_key) to ensure_child_row_multiplicity; CargoHandler passes vary_key on drivers/vehicles/commodities/loss schedules so counts differ across policies.",
+      "test": "test_new_template_defects.py::test_cargo_child_counts_vary_across_insureds"
+    },
+    {
+      "defect_id": "APD-014",
+      "module": "APD / (child schedules)",
+      "field": "Record counts",
+      "summary": "Record counts follow a fixed/repetitive pattern; should be randomised per policy.",
+      "verdict": "Fixed",
+      "root_cause": "Same as CARGO-008 (shared auto handler).",
+      "fix": "vary_key wired on APD drivers/vehicles/trailers/commodities/loss schedules.",
+      "test": "test_new_template_defects.py::test_apd_child_counts_vary_across_insureds"
+    },
+    {
+      "defect_id": "WH-001",
+      "module": "WH / Policy info",
+      "field": "Phone / Fax",
+      "summary": "Phone/Fax not in valid U.S. format.",
+      "verdict": "Fixed",
+      "root_cause": "Already closed by the universal variety pass (format_phone_fax) which runs for the whole SPG family including WH.",
+      "fix": "No new change required; verified WH is in _SPG_LOBS and runs enforce_variety_fields.",
+      "test": "test_new_template_defects.py::test_wh_phone_and_state_variety"
+    },
+    {
+      "defect_id": "WH-002",
+      "module": "WH / Policy info + WH locations",
+      "field": "All state fields",
+      "summary": "State fields restricted to the Binding State dropdown; should allow all states.",
+      "verdict": "Fixed",
+      "root_cause": "Already closed by spread_address_states (now also keeps City/ZIP consistent).",
+      "fix": "No new change required for state variety; the Class-B rewrite additionally makes the spread ZIP-consistent.",
+      "test": "test_new_template_defects.py::test_wh_phone_and_state_variety"
+    },
+    {
+      "defect_id": "APD-006/007/008/009",
+      "module": "APD / Drivers, Vehicles, Trailers, Commodities",
+      "field": "(rows)",
+      "summary": "Only a single entry generated though up to 20 are supported.",
+      "verdict": "Fixed",
+      "root_cause": "Already closed by ensure_child_row_multiplicity (multi-row guarantee); now additionally varied per insured.",
+      "fix": "Verified existing multiplicity + added count variation (APD-014).",
+      "test": "test_new_template_defects.py::test_apd_units_multi_row"
+    },
+    {
+      "defect_id": "APD-010/011",
+      "module": "APD / LossPayees, Loss History",
+      "field": "(rows)",
+      "summary": "Loss Payees / Loss History generated a single row; require 1-10.",
+      "verdict": "Fixed",
+      "root_cause": "Already closed by the loss-payee/loss-history fixers (multi-row 1-10, blank when none).",
+      "fix": "Verified existing behaviour; added count variation.",
+      "test": "test_new_template_defects.py::test_apd_loss_payees_and_history"
+    },
+    {
+      "defect_id": "APD-012",
+      "module": "APD / APD Scenario",
+      "field": "(sheet)",
+      "summary": "Test Scenario Details sheet missing.",
+      "verdict": "Fixed",
+      "root_cause": "Already closed — the auto handler builds the deterministic Test Scenario Details summary in pre_generate.",
+      "fix": "Verified existing scenario-sheet builder.",
+      "test": "test_new_template_defects.py::test_apd_scenario_details_built"
+    }
+  ]
+}

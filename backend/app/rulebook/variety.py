@@ -25,8 +25,11 @@ primitives.
 """
 from __future__ import annotations
 
+import hashlib
+import re
 from typing import Any, Sequence
 
+from .geo import geo_for_state
 from .primitives import (
     US_STATES,
     column_seed,
@@ -47,6 +50,25 @@ def _number_col(row: dict[str, Any]) -> str | None:
     return next((k for k in row if k.strip() == "#"), None)
 
 
+# How far above ``min_per_tid`` a per-insured count may vary when ``vary_key`` is
+# supplied (CARGO-008 / APD-014): keeps sheets reasonably sized while breaking the
+# fixed "always N" / "2-2-1" pattern QA flagged.
+_VARY_BAND = 6
+
+
+def _varied_target(vary_key: str, tid: str, min_per_tid: int, max_per_tid: int) -> int:
+    """Deterministic per-(schedule, insured) row target in a band above the min.
+
+    Stable for a given (vary_key, tid) so runs are reproducible; different schedules
+    and different insureds get different counts, so no fixed pattern emerges.
+    """
+    band = min(max_per_tid, min_per_tid + _VARY_BAND) - min_per_tid
+    if band <= 0:
+        return min_per_tid
+    h = int(hashlib.md5(f"{vary_key}|{tid}".encode()).hexdigest(), 16)
+    return min_per_tid + (h % (band + 1))
+
+
 def ensure_child_row_multiplicity(
     rows: list[dict[str, Any]],
     *,
@@ -54,6 +76,7 @@ def ensure_child_row_multiplicity(
     max_per_tid: int,
     unique_frags: Sequence[str] = (),
     skip_predicate=None,
+    vary_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically guarantee each Test ID carries a multi-row child schedule.
 
@@ -66,11 +89,16 @@ def ensure_child_row_multiplicity(
 
     For every Test ID that already has at least one row, the group is:
 
-    * **expanded** up to ``min_per_tid`` by cloning its existing rows round-robin —
-      re-sequencing the literal ``#`` column and appending a ``-N`` suffix to any
-      ``unique_frags`` identifier (Serial Number, VIN, Loan Number, …) so cloned
-      rows stay distinct; and
+    * **expanded** up to a per-group target (``min_per_tid`` by default) by cloning
+      its existing rows round-robin — re-sequencing the literal ``#`` column and
+      appending a ``-N`` suffix to any ``unique_frags`` identifier (Serial Number,
+      VIN, Loan Number, …) so cloned rows stay distinct; and
     * **capped** at ``max_per_tid`` (the ruleset upper bound).
+
+    When ``vary_key`` is supplied the target is *varied per insured* in a band above
+    ``min_per_tid`` (deterministically, keyed by ``vary_key`` + Test ID) so counts
+    do not follow a fixed pattern across policies (CARGO-008 / APD-014). Without it,
+    the target is exactly ``min_per_tid`` (stable minimum-guarantee behaviour).
 
     ``skip_predicate(first_row)`` suppresses expansion for a group (used for
     "no losses" loss-history rows, which must stay a single blank row). Groups are
@@ -92,8 +120,10 @@ def ensure_child_row_multiplicity(
         grp = list(groups[t][:max_per_tid])
         seeds = list(grp)
         if seeds and not (skip_predicate and skip_predicate(seeds[0])):
+            target = (_varied_target(vary_key, t, min_per_tid, max_per_tid)
+                      if vary_key is not None else min_per_tid)
             k = 0
-            while len(grp) < min_per_tid:
+            while len(grp) < target:
                 clone = dict(seeds[k % len(seeds)])
                 suffix = len(grp) + 1
                 for uf in unique_frags:
@@ -135,26 +165,77 @@ def _binding_value(row: dict[str, Any]) -> str | None:
     return None
 
 
+# Address-block column classification. A physical-address block is the set of
+# City / State / ZIP columns that share a name prefix ("Address – City/State/Zip",
+# "Mailing City/State/Zip", "Agency Address State", …). The block is keyed by that
+# prefix so its sibling columns can be assigned a *consistent* (state, city, zip)
+# triple together — never a valid ZIP under a mismatched state.
+_KIND_STRIP = {"zip", "zipcode", "postal", "code", "city", "state", "st"}
+
+
+def _addr_kind(col: str) -> str | None:
+    """Classify an address column as ``state`` / ``city`` / ``zip`` (or None).
+
+    The Binding/Rating dropdown is never an address column (it stays untouched).
+    """
+    if is_binding_state_field(col):
+        return None
+    kl = col.strip().lower()
+    if "zip" in kl or "postal" in kl:
+        return "zip"
+    if "city" in kl:
+        return "city"
+    if "state" in kl or kl == "st":
+        return "state"
+    return None
+
+
+def _block_key(col: str) -> str:
+    """The block prefix for an address column (kind words + digits stripped)."""
+    toks = re.split(r"[^a-z0-9]+", col.strip().lower())
+    keep = [t for t in toks if t and not t.isdigit() and t not in _KIND_STRIP]
+    return " ".join(keep)
+
+
+def _address_blocks(keys: Sequence[str]) -> dict[str, dict[str, str]]:
+    """Group header keys into address blocks: prefix -> {kind: column}."""
+    blocks: dict[str, dict[str, str]] = {}
+    for k in keys:
+        kind = _addr_kind(k)
+        if not kind:
+            continue
+        blocks.setdefault(_block_key(k), {}).setdefault(kind, k)
+    return blocks
+
+
 def spread_address_states(
     rows: list[dict[str, Any]],
     *,
     state_selection: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Fan physical-address state columns across the full US-state pool.
+    """Fan physical-address blocks across the US-state pool, keeping City/State/ZIP
+    consistent.
 
-    For every column that is a state field but **not** the restricted
-    Binding/Rating dropdown, each *populated* cell is reassigned a state from the
-    pool by :func:`spread_pick`, phased per column so sibling address fields in
-    one row show different states (real combinations). The binding/rating column
-    itself is never touched, and blank cells are preserved (so handler
-    dependency-blanking such as "Mailing State blank when not different" survives).
+    Address columns are grouped into blocks by their shared name prefix. For every
+    block that carries a State column (but is **not** the restricted Binding/Rating
+    dropdown), each *populated* cell is reassigned a state from the pool by
+    :func:`spread_pick`, phased per block so sibling address blocks in one row show
+    different states (real combinations). When the block also has City and/or ZIP
+    columns, those are set from :data:`~app.rulebook.geo.STATE_GEO` so the whole
+    triple corresponds — the ZIP always belongs to the assigned state and city.
 
-    Frontend overrides win: when ``state_selection`` is supplied (UI state
-    filter), the pool is exactly those states, so address states stay inside the
-    user's selection instead of the full list.
+    The binding/rating column itself is never touched, and blank cells are
+    preserved (so handler dependency-blanking such as "Mailing State blank when not
+    different" survives — a blank State skips its whole block for that row).
 
-    Closes the state cluster: DF-IM-012/015/016/018, DEF-011/012/013/014/016,
-    HO-015, CARGO-003, APD-003.
+    Frontend overrides win: when ``state_selection`` is supplied (UI state filter),
+    the pool is exactly those states, so address states stay inside the user's
+    selection instead of the full list.
+
+    Closes the state cluster (DF-IM-012/015/016/018, DEF-011/012/013/014/016,
+    HO-015, CARGO-003, APD-003) and the City/State/ZIP correspondence class
+    (DEF-024 / HO-023 / CARGO-007 / WH-004 / APD-015 and the IM generic address
+    defect).
     """
     pool: tuple[str, ...] | list[str]
     if state_selection:
@@ -164,25 +245,32 @@ def spread_address_states(
     else:
         pool = US_STATES
 
-    # Address-state columns = any "*state*" column (or a bare "St" abbreviation,
-    # as on the WH Locations sheet) that is not the Binding/Rating dropdown.
-    def _is_addr_state_col(k: str) -> bool:
-        kl = k.strip().lower()
-        is_state = ("state" in kl) or kl == "st"
-        return is_state and not is_binding_state_field(k)
-
-    state_cols = [k for k in (rows[0].keys() if rows else []) if _is_addr_state_col(k)]
-    if not state_cols:
+    blocks = _address_blocks(rows[0].keys() if rows else [])
+    state_blocks = {bk: b for bk, b in blocks.items() if "state" in b}
+    if not state_blocks:
         return rows
 
-    for col in state_cols:
-        seed = column_seed(col)
+    for bk, cols in state_blocks.items():
+        state_col = cols["state"]
+        city_col = cols.get("city")
+        zip_col = cols.get("zip")
+        seed = column_seed(state_col)
         for i, row in enumerate(rows):
-            val = row.get(col)
-            if _is_blank(val):
+            if _is_blank(row.get(state_col)):
                 continue  # preserve intentional blanks (dependency rules)
             avoid = _binding_value(row) if len(pool) > 1 else None
-            row[col] = spread_pick(i, pool, seed=seed, avoid=avoid)
+            state = spread_pick(i, pool, seed=seed, avoid=avoid)
+            row[state_col] = state
+            if not (city_col or zip_col):
+                continue
+            geo = geo_for_state(state)
+            if not geo:
+                continue
+            city, zipcode = spread_pick(i, geo, seed=seed + 1)
+            if city_col:
+                row[city_col] = city
+            if zip_col:
+                row[zip_col] = zipcode
     return rows
 
 
