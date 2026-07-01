@@ -50,6 +50,11 @@ def _number_col(row: dict[str, Any]) -> str | None:
     return next((k for k in row if k.strip() == "#"), None)
 
 
+def _tid_key(row: dict[str, Any]) -> str | None:
+    """The row's ``Test ID`` column name (the cross-sheet join key), if present."""
+    return next((k for k in row if k.lower().strip() == "test id"), None)
+
+
 # How far above ``min_per_tid`` a per-insured count may vary when ``vary_key`` is
 # supplied (CARGO-008 / APD-014): keeps sheets reasonably sized while breaking the
 # fixed "always N" / "2-2-1" pattern QA flagged.
@@ -77,6 +82,7 @@ def ensure_child_row_multiplicity(
     unique_frags: Sequence[str] = (),
     skip_predicate=None,
     vary_key: str | None = None,
+    all_test_ids: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Deterministically guarantee each Test ID carries a multi-row child schedule.
 
@@ -103,6 +109,16 @@ def ensure_child_row_multiplicity(
     ``skip_predicate(first_row)`` suppresses expansion for a group (used for
     "no losses" loss-history rows, which must stay a single blank row). Groups are
     emitted in first-seen Test ID order; rows with no Test ID are passed through.
+
+    ``all_test_ids`` is the authoritative Test-ID roster (from Policy Info). On a
+    large request the LLM anchors to the first few Test IDs and stops, so most
+    insureds receive *zero* child rows (the HO "6 loss payees for 50 test cases"
+    defect). Because child-row multiplicity is a **deterministic** field
+    (CLAUDE.md §2), the roster — not the LLM output — decides which insureds get a
+    schedule: any roster Test ID with no produced rows is seeded from a donor row
+    (round-robin over the produced rows, stamped with the missing Test ID) so the
+    expand/cap loop below fills it like any other group. Omit it to keep the prior
+    "expand only what the LLM emitted" behaviour.
     """
     if not rows:
         return rows
@@ -114,6 +130,26 @@ def ensure_child_row_multiplicity(
         if t not in order:
             order.append(t)
         groups[t].append(r)
+
+    if all_test_ids:
+        tid_key = _tid_key(rows[0])
+        donors = list(rows)
+        di = 0
+        for t in all_test_ids:
+            if t in groups:
+                continue
+            seed = dict(donors[di % len(donors)])
+            di += 1
+            if tid_key:
+                seed[tid_key] = t
+            # Keep unique identifiers (Loan Number, Serial/VIN, …) distinct across
+            # insureds — the donor's value belongs to another Test ID.
+            for uf in unique_frags:
+                col = find_col(seed, uf)
+                if col and str(seed.get(col) or "").strip():
+                    seed[col] = f"{seed[col]}-{t}"
+            groups[t] = [seed]
+            order.append(t)
 
     out: list[dict[str, Any]] = []
     for t in order:

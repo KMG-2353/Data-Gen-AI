@@ -366,6 +366,11 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             return _normalize_common(self._fix_policy_info(rows))
         # Every other generated sheet joins back to Policy Info by Test ID.
         self._normalize_test_ids(rows, previous_sheets_data)
+        # Authoritative Test-ID roster: every insured on Policy Info MUST carry a
+        # child schedule, even the ones the LLM omitted on large requests
+        # (HO-013: "6 loss payees for 50 test cases"). Anchoring multiplicity to
+        # the roster — not the LLM's partial output — closes that class.
+        roster = [_tid(r) for r in _policy_info_rows(previous_sheets_data) if _tid(r)]
         if st == "uw_history":
             rows = self._fix_uw_history(rows)
         elif st == "property":
@@ -374,7 +379,8 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             # HO Dwelling is single-row per insured (_property_max is None).
             if self._property_max:
                 rows = ensure_child_row_multiplicity(
-                    rows, min_per_tid=_LOCATIONS_PER_INSURED, max_per_tid=self._property_max)
+                    rows, min_per_tid=_LOCATIONS_PER_INSURED, max_per_tid=self._property_max,
+                    all_test_ids=roster)
             rows = self._fix_property(rows)
         elif st == "coverages":
             rows = self._fix_coverages(rows)
@@ -382,14 +388,14 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             # DEF-009 / HO-010: 1–10 loss payees per policy, multiple.
             rows = ensure_child_row_multiplicity(
                 rows, min_per_tid=_LOSS_PAYEES_PER_INSURED, max_per_tid=_MAX_LOSS_PAYEES,
-                unique_frags=("loan number",))
+                unique_frags=("loan number",), all_test_ids=roster)
             rows = self._fix_loss_payees(rows)
         elif st == "loss_history":
             # DEF-010 / HO-012: a loss policy carries a multi-row schedule (1–10);
             # no-loss policies stay a single blank row.
             rows = ensure_child_row_multiplicity(
                 rows, min_per_tid=_LOSS_HISTORY_PER_INSURED, max_per_tid=_MAX_LOSS_HISTORY,
-                skip_predicate=_no_losses_5yr)
+                skip_predicate=_no_losses_5yr, all_test_ids=roster)
             rows = self._fix_loss_history(rows, previous_sheets_data)
         return _normalize_common(rows)
 

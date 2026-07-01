@@ -229,3 +229,50 @@ def test_ho_child_counts_request_multiples(handler):
     lp_count, _ = handler.build_sheet_context("HO LossPayees", policy, None, 2)
     lh_count, _ = handler.build_sheet_context("HO LossHistory", policy, None, 2)
     assert lp_count >= 4 and lh_count >= 4
+
+
+# ---------------------------------------------------------------------------
+# HO-013 — large data set: child schedules must cover EVERY test case, not just
+# the first few the LLM emitted ("6 loss payees for 50 test cases").
+# ---------------------------------------------------------------------------
+
+def _roster(n):
+    from app.rulebook.primitives import default_test_id
+    # Handler normalizes to zero-padded 2-digit ids (TS-01 … TS-50).
+    return [{"Test ID": f"TS-{i:02d}"} for i in range(1, n + 1)]
+
+
+def test_loss_payees_cover_all_test_cases_on_large_set(handler):
+    """LLM produced payees for only the first 6 of 50 insureds; the roster-anchored
+    multiplicity pass must synthesise the missing 44 so all 50 are represented."""
+    policy = _roster(50)
+    rows = [
+        {"Test ID": f"TS-{i:02d}", "State": "VA", "Is Mortgagee?": "Yes",
+         "Loan Number": f"L{i}-{j}", "Mortgage Current?": "Yes"}
+        for i in range(1, 7) for j in range(10)          # only TS-01..TS-06, 10 each
+    ]
+    out = handler.post_process(rows, "HO LossPayees", "", {"Policy Info": policy})
+    covered = {r["Test ID"] for r in out}
+    assert covered == {f"TS-{i:02d}" for i in range(1, 51)}   # all 50 present
+    for i in range(1, 51):                                    # each within 3–10
+        n = len([r for r in out if r["Test ID"] == f"TS-{i:02d}"])
+        assert 3 <= n <= 10, f"TS-{i:02d} has {n} payees"
+    # Synthesised insureds keep distinct loan numbers (no cross-Test-ID dupes).
+    loans = [str(r.get("Loan Number") or "") for r in out
+             if str(r.get("Is Mortgagee?", "")).strip().lower() == "yes"
+             and str(r.get("Loan Number") or "").strip()]
+    assert len(loans) == len(set(loans))
+
+
+def test_loss_history_cover_all_test_cases_on_large_set(handler):
+    policy = [{"Test ID": f"TS-{i:02d}", "Effective Date": "05/27/2026"}
+              for i in range(1, 51)]
+    rows = [
+        {"Test ID": f"TS-{i:02d}", "Any Open Claims?": "No",
+         "Any Losses in Past 5 Years?": "Yes", "#": j,
+         "Loss Date": "01/15/2025", "Amount": "5000"}
+        for i in range(1, 7) for j in range(1, 4)        # only TS-01..TS-06
+    ]
+    out = handler.post_process(rows, "HO Loss History", "", {"Policy Info": policy})
+    covered = {r["Test ID"] for r in out}
+    assert covered == {f"TS-{i:02d}" for i in range(1, 51)}
