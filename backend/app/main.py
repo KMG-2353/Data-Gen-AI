@@ -1,5 +1,9 @@
 import re
 
+# Control chars the OOXML/openpyxl writer rejects (C0 controls except tab/LF/CR).
+# An LLM value containing e.g. 0x0B otherwise crashes the entire xlsx download.
+_ILLEGAL_XLSX_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -482,6 +486,11 @@ async def download_excel(session_id: str):
         for row_idx, row_data in enumerate(data, 2):
             for col_idx, unique_header in enumerate(unique_headers, 1):
                 value = row_data.get(unique_header, "")
+                # Strip control characters openpyxl rejects (e.g. an LLM-emitted
+                # 0x0B inside a value crashed the whole download). Sanitising at
+                # the write boundary keeps ANY model output safe to serialise.
+                if isinstance(value, str):
+                    value = _ILLEGAL_XLSX_CHARS.sub("", value)
                 sheet.cell(row=row_idx, column=col_idx, value=value)
 
         # Auto-adjust column widths

@@ -33,6 +33,7 @@ from app.rulebook.primitives import (
     format_date_slash as _fmt_date,
     normalize_sheet_name as _norm_sheet,
     parse_date as _parse_date,
+    pin_quote_effective_expiration as _pin_policy_dates,
     spread_pick as _spread_pick,
     tid_value as _tid,
 )
@@ -139,8 +140,12 @@ SPG WIND/HAIL — LOCATIONS RULES (HARD CONSTRAINTS):
             self._fix_policy(rows)
             return rows
         if st == "locations":
+            # Anchor to the Policy roster so every insured gets locations and no
+            # orphan (LLM-invented) Test ID leaks into the schedule.
+            roster = [_tid(r) for r in _policy_rows(previous_sheets_data) if _tid(r)]
             return ensure_child_row_multiplicity(
                 rows, min_per_tid=_LOCATIONS_PER_INSURED, max_per_tid=_MAX_LOCATIONS,
+                all_test_ids=roster or None,
             )
         return rows
 
@@ -157,16 +162,9 @@ SPG WIND/HAIL — LOCATIONS RULES (HARD CONSTRAINTS):
             if entity_key:
                 row[entity_key] = _spread_pick(idx, _WH_ENTITY_TYPES, seed=ent_seed)
 
-            eff_key = _find_col(row, "effective date")
-            exp_key = _find_col(row, "expiration date")
-            quote_key = _find_col(row, "quote date") or _find_col(row, "date of quote")
-            eff = _parse_date(row.get(eff_key)) if eff_key else None
-            if eff and exp_key:
-                row[exp_key] = _fmt_date(_add_one_year(eff))
-            if eff and quote_key:
-                quote = _parse_date(row.get(quote_key))
-                if quote is None or quote > eff:
-                    row[quote_key] = _fmt_date(eff - timedelta(days=random.randint(1, 14)))
+            # WH-005: Quote Date pinned to today (data-creation date), Effective
+            # clamped to >= today, Expiration = Effective + 1 year.
+            _pin_policy_dates(row)
 
     def _build_scenario_details(
         self,

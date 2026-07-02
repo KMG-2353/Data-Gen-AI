@@ -35,6 +35,7 @@ from app.rulebook.primitives import (
     spread_pick as _spread_pick,
     column_seed as _col_seed,
     normalize_sheet_name as _norm_sheet,
+    pin_quote_effective_expiration as _pin_policy_dates,
 )
 from app.rulebook.variety import ensure_child_row_multiplicity
 
@@ -57,11 +58,17 @@ _MAX_LOSS_PAYEES = 10
 
 
 def _get_policy_rows(previous: dict | None) -> list[dict]:
-    """Locate the Policy Info rows in the already-generated sheets map."""
+    """Locate the Policy Info rows in the already-generated sheets map.
+
+    Normalises the sheet name first so the numbered blank template (``01_Policy_
+    Info`` -> ``01 policy info``) matches as well as the legacy ``Policy Info``;
+    without this the IM roster came back empty and child sheets kept orphan
+    (LLM-invented) Test IDs.
+    """
     if not previous:
         return []
     for name, rows in previous.items():
-        if "policy info" in name.lower():
+        if "policy info" in _norm_sheet(name):
             return rows or []
     return []
 
@@ -255,7 +262,7 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
         if sheet_type == "loss_history":
             return self._fix_loss_history(rows, previous_sheets_data)
         if sheet_type == "loss_payees":
-            return self._fix_loss_payees(rows)
+            return self._fix_loss_payees(rows, previous_sheets_data)
         if sheet_type == "additional_interests":
             return self._fix_additional_interests(rows)
         return rows
@@ -288,16 +295,11 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
             if tid_key is not None:
                 row[tid_key] = _default_tid(idx + 1)
 
-            eff_key = _find_col(row, "effective date")
-            # "Date of Quote" (legacy) / "Quote Date" (numbered template).
-            quote_key = _find_col(row, "date of quote") or _find_col(row, "quote date")
-            if eff_key and quote_key:
-                eff = _parse_date(row.get(eff_key))
-                quote = _parse_date(row.get(quote_key))
-                # DF-IM-001 / DF-IM-002: Date of Quote must be <= Effective Date.
-                if eff and (quote is None or quote > eff):
-                    # Place the quote a few days before the effective date.
-                    row[quote_key] = _fmt_date(eff - timedelta(days=random.randint(1, 14)))
+            # DF-IM-020/022: Quote Date is pinned to today (data-creation date),
+            # Effective Date clamped to >= today, Expiration = Effective + 1 year.
+            # (Supersedes the old "quote a few days before effective" clamp — the
+            # quote can never precede coverage now that it is today.)
+            _pin_policy_dates(row)
 
             # DF-IM-013: the LLM collapses Type of Entity onto Corporation/LLC.
             # Deterministically fan it across the full dropdown so every option is
@@ -432,34 +434,87 @@ SPG INLAND MARINE — ADDITIONAL INTERESTS RULES (HARD CONSTRAINTS):
 
         # DF-IM-017: an insured may carry MULTIPLE equipment rows (up to 20).
         # Counts are deterministic — guarantee the multi-row minimum per insured
-        # and cap at 20 instead of trusting the LLM to vary the row count.
+        # and cap at 20 instead of trusting the LLM to vary the row count. Anchor
+        # to the coverage-eligible Policy roster so every real insured is covered
+        # and no orphan (LLM-invented) Test ID leaks into the schedule.
+        roster = [_tid(pi) for pi in pi_rows
+                  if _tid(pi) and coverage_by_tid.get(_tid(pi), True)]
         return ensure_child_row_multiplicity(
             kept,
             min_per_tid=_EQUIP_PER_INSURED,
             max_per_tid=_MAX_EQUIPMENT,
             unique_frags=("serial number",),
+            all_test_ids=roster or None,
         )
 
-    def _fix_loss_payees(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Blank loss-payee detail when "Has Loss Payees? = No", then guarantee a
-        1–10 multi-row schedule per policy (DF-IM-018)."""
-        for row in rows:
-            flag_key = _find_col(row, "has loss payees") or _find_col(row, "loss payee?")
-            if flag_key and _is_no(row.get(flag_key)):
-                for frag in ("loss payee name", "street address", "city", "state",
-                             "zip", "equipment item", "interest type", "loan number"):
-                    k = _find_col(row, frag)
-                    if k:
-                        row[k] = ""
-        return ensure_child_row_multiplicity(
+    _LP_DETAIL_FRAGS = ("loss payee name", "street address", "city", "state",
+                        "zip", "equipment item", "interest type", "loan number",
+                        "notes")
+
+    def _fix_loss_payees(
+        self,
+        rows: list[dict[str, Any]],
+        previous_sheets_data: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        """"Has Loss Payees?" must VARY Yes/No per insured — the LLM collapses it
+        onto Yes for everyone (DF-IM-018). The flag is a deterministic field: the
+        engine spreads Yes/No across insureds, a Yes insured carries a 1–10 multi-
+        row schedule, and a No insured carries a SINGLE row with every loss-payee
+        detail (and the # column) BLANK. Anchored to the Policy roster so every
+        insured is covered and no orphan Test ID leaks in."""
+        if not rows:
+            return rows
+
+        flag_key = next(
+            (fk for r in rows
+             if (fk := _find_col(r, "has loss payees") or _find_col(r, "loss payee?"))),
+            None,
+        )
+        roster = [_tid(pi) for pi in _get_policy_rows(previous_sheets_data) if _tid(pi)]
+
+        # Deterministic Yes/No spread, one flag per insured (stable across all of
+        # that insured's rows). Assigned over the roster so seeded insureds get a
+        # flag too; falls back to the produced Test-ID order when no roster.
+        tids = list(roster)
+        for r in rows:
+            t = _tid(r)
+            if t and t not in tids:
+                tids.append(t)
+        seed = _col_seed(flag_key) if flag_key else 0
+        flag_by_tid = {t: _spread_pick(i, ("Yes", "No"), seed=seed)
+                       for i, t in enumerate(tids)}
+
+        def _no_lp(row: dict[str, Any]) -> bool:
+            return flag_by_tid.get(_tid(row)) == "No"
+
+        def _apply(row_list: list[dict[str, Any]]) -> None:
+            for row in row_list:
+                f = flag_by_tid.get(_tid(row))
+                if flag_key and f:
+                    row[flag_key] = f
+                if _no_lp(row):
+                    for frag in self._LP_DETAIL_FRAGS:
+                        k = _find_col(row, frag)
+                        if k:
+                            row[k] = ""
+                    num_key = next((k for k in row if k.strip() == "#"), None)
+                    if num_key:
+                        row[num_key] = ""
+
+        # Stamp the flag (and blank No detail) BEFORE expansion so the skip
+        # predicate classifies every group by its assigned flag …
+        _apply(rows)
+        out = ensure_child_row_multiplicity(
             rows,
             min_per_tid=_LOSSPAYEE_PER_INSURED,
             max_per_tid=_MAX_LOSS_PAYEES,
             unique_frags=("loan number",),
-            skip_predicate=lambda r: (
-                lambda fk: bool(fk) and _is_no(r.get(fk))
-            )(_find_col(r, "has loss payees") or _find_col(r, "loss payee?")),
+            skip_predicate=_no_lp,
+            all_test_ids=roster or None,
         )
+        # … and again afterwards so roster-seeded rows carry the right flag/blanks.
+        _apply(out)
+        return out
 
     def _fix_misc_articles(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Coerce Total Value to numeric $0–$10k; blank it when coverage = No

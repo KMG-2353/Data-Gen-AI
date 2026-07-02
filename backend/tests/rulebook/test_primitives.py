@@ -3,8 +3,41 @@ from datetime import date
 from app.rulebook.primitives import (
     parse_date, format_date_slash, format_date_compact, add_one_year,
     to_number, find_col, find_header_key, tid_value, is_yes, is_no,
-    default_test_id,
+    default_test_id, pin_quote_effective_expiration,
 )
+
+
+def test_pin_quote_effective_expiration_pins_today_and_derives():
+    today = date(2026, 7, 2)
+    # Past effective -> clamped up to today; quote pinned to today; exp = eff+1yr.
+    row = {"Effective Date": "05/27/2026", "Expiration Date": "",
+           "Date of Quote": "05/20/2026"}
+    pin_quote_effective_expiration(row, today=today)
+    assert row["Date of Quote"] == "07/02/2026"
+    assert row["Effective Date"] == "07/02/2026"
+    assert row["Expiration Date"] == "07/02/2027"
+
+    # Future effective preserved; quote still today; exp = eff+1yr.
+    row2 = {"Effective Date": "12/01/2027", "Expiration Date": "",
+            "Quote Date": "01/01/2026"}
+    pin_quote_effective_expiration(row2, today=today)
+    assert row2["Quote Date"] == "07/02/2026"
+    assert row2["Effective Date"] == "12/01/2027"
+    assert row2["Expiration Date"] == "12/01/2028"
+
+
+def test_pin_quote_is_idempotent_and_safe_on_missing_cols():
+    today = date(2026, 7, 2)
+    row = {"Quote Date": "01/01/2020", "Effective Date": "12/01/2027",
+           "Expiration Date": ""}
+    pin_quote_effective_expiration(row, today=today)
+    once = dict(row)
+    pin_quote_effective_expiration(row, today=today)
+    assert row == once  # idempotent
+    # No date columns at all -> no error, no mutation.
+    bare = {"Name": "Acme"}
+    pin_quote_effective_expiration(bare, today=today)
+    assert bare == {"Name": "Acme"}
 
 
 def test_default_test_id_is_ts_zero_padded():

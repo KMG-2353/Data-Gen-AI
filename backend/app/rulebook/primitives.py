@@ -62,6 +62,36 @@ def add_one_year(d: date) -> date:
         return d.replace(month=2, day=28, year=d.year + 1)
 
 
+def pin_quote_effective_expiration(row: dict, today: date | None = None) -> None:
+    """SPG-wide policy-date rule (single source of truth).
+
+    The QA-approved DW/HO behaviour (``spg_pl``) is now the standard for **every**
+    SPG LOB (IM, Cargo, APD, Wind/Hail): the Date of Quote is the data-creation
+    date — always *today*, never a past or future date — the Effective Date is
+    clamped to be on or after today (coverage cannot begin before the quote is
+    created), and the Expiration Date is derived as Effective + 1 year.
+
+    Closes the SPG quote-date defect class in one place: DF-IM-020/022, WH-005,
+    APD-016, CARGO-008(quote), alongside the DW/HO originals DEF-002/023,
+    HO-002/022. Idempotent and safe to call on any row (no-ops on missing cols).
+    """
+    today = today or date.today()
+    eff_key = find_col(row, "effective date")
+    exp_key = find_col(row, "expiration date")
+    # "Quote Date" (numbered templates) / "Date of Quote" (legacy IM template).
+    quote_key = find_col(row, "quote date") or find_col(row, "date of quote")
+
+    eff = parse_date(row.get(eff_key)) if eff_key else None
+    if eff and eff < today:
+        eff = today
+        if eff_key:
+            row[eff_key] = format_date_slash(eff)
+    if eff and exp_key:
+        row[exp_key] = format_date_slash(add_one_year(eff))
+    if quote_key:
+        row[quote_key] = format_date_slash(today)
+
+
 def to_number(val: Any) -> float | int | None:
     """Strip ``$``, commas, whitespace; return int when whole, else 2dp float."""
     s = str(val or "").strip().replace("$", "").replace(",", "").strip()

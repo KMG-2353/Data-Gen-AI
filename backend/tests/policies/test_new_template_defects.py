@@ -102,22 +102,31 @@ def test_im_equipment_multi_row():
     assert all(25000 < int(r["Value ($)"]) <= 50000 for r in out)
 
 
-def test_im_loss_payees_multi_and_blank():
-    # DF-IM-018: multiple loss payees per policy; blank detail when "Has Loss Payees? = No".
+def test_im_loss_payees_varied_yes_no_and_blank():
+    # DF-IM-018: "Has Loss Payees?" must VARY Yes/No across insureds — the LLM
+    # collapses it onto Yes for everyone. Yes insureds carry a 1–10 multi-row
+    # schedule; No insureds carry a SINGLE row with every detail (and #) blank.
     handler = ImHandler()
-    rows = [
-        {"Test ID": "TS-001", "Has Loss Payees?  (Yes / No)": "Yes", "#": 1,
-         "Loss Payee Name": "Bank", "State": "VA", "Loan Number": "L1"},
-        {"Test ID": "TS-002", "Has Loss Payees?  (Yes / No)": "No", "#": 1,
-         "Loss Payee Name": "ZZ", "State": "MD", "Loan Number": "L2"},
-    ]
-    out = handler.post_process(rows, "05_IM_LossPayees", "",
-                               {"01_Policy_Info": [{"Test ID": "TS-001"}, {"Test ID": "TS-002"}]})
+    roster = [{"Test ID": f"TS-{i:03d}"} for i in range(1, 7)]
+    rows = [{"Test ID": f"TS-{i:03d}", "Has Loss Payees?  (Yes / No)": "Yes", "#": 1,
+             "Loss Payee Name": "Bank", "State": "VA", "Loan Number": f"L{i}"}
+            for i in range(1, 7)]
+    out = handler.post_process(rows, "05_IM_LossPayees", "", {"01_Policy_Info": roster})
+
+    flag_key = "Has Loss Payees?  (Yes / No)"
+    flags = {r["Test ID"]: r[flag_key] for r in out}
+    assert set(flags.values()) == {"Yes", "No"}            # both values appear
+
     counts = Counter(r["Test ID"] for r in out)
-    assert counts["TS-001"] >= 2          # expanded
-    assert counts["TS-002"] == 1          # no-payee policy stays a single (blank) row
-    ts2 = next(r for r in out if r["Test ID"] == "TS-002")
-    assert ts2["Loss Payee Name"] == ""
+    for tid, f in flags.items():
+        if f == "No":
+            assert counts[tid] == 1                        # single row
+            row = next(r for r in out if r["Test ID"] == tid)
+            assert row["Loss Payee Name"] == ""            # blank detail …
+            assert row["Loan Number"] == ""
+            assert row["#"] == ""                          # … and blank #
+        else:
+            assert counts[tid] >= 2                        # multi-row schedule
 
 
 def test_im_misc_total_blank_when_disabled():
@@ -210,14 +219,19 @@ def test_apd_scenario_details_built():
 # ---------------------------------------------------------------------------
 
 def test_wh_policy_entity_exp_quote():
+    from datetime import date
+    from app.rulebook.primitives import format_date_slash
     handler = WhHandler()
+    # Future effective date so it is preserved (not clamped up to today).
     rows = [{"Test ID": "x", "Type of Entity": "Corporation",
-             "Effective Date": "05/27/2026", "Expiration Date": "",
+             "Effective Date": "12/01/2027", "Expiration Date": "",
              "Quote Date": "06/10/2026"} for _ in range(6)]
     out = handler.post_process([dict(r) for r in rows], "01_Policy_Info", "")
     assert {r["Type of Entity"] for r in out} <= set(_WH_ENTITY_TYPES)
     assert len({r["Type of Entity"] for r in out}) >= 4
-    assert out[0]["Expiration Date"] == "05/27/2027"      # eff + 1 year
+    assert out[0]["Expiration Date"] == "12/01/2028"      # eff + 1 year
+    # WH-005: Quote Date pinned to today (data-creation date).
+    assert out[0]["Quote Date"] == format_date_slash(date.today())
 
 
 def test_wh_phone_and_state_variety():
@@ -490,14 +504,25 @@ def test_apd_child_counts_vary_across_insureds():
     assert len(set(counts.values())) > 1            # not a single fixed count
 
 
-def test_cargo_child_counts_vary_across_insureds():
-    # CARGO-008: Cargo schedule counts must be randomised per policy, not a fixed
-    # pattern. Shares the auto handler's varied-multiplicity path.
+def test_cargo_child_counts_one_per_policy():
+    # Cargo defect ("for 20 sets generates 60 instead of 20"): each policy carries
+    # EXACTLY ONE child record by default, so N test cases yield N records — not a
+    # ballooned multi-row schedule. (APD keeps the multi-entry default.)
     handler = CargoHandler()
     prev = {"01_Policy_Info": [{"Test ID": f"TS-0{i:02d}"} for i in range(1, 9)]}
     rows = [{"Test ID": f"TS-0{i:02d}", "Commodity (Select from list)": "Steel"}
             for i in range(1, 9)]
     out = handler.post_process(rows, "05_Cargo_Commodities", "", prev)
     counts = Counter(r["Test ID"] for r in out)
-    assert all(c >= 1 for c in counts.values())
-    assert len(set(counts.values())) > 1            # not a single fixed count
+    assert set(counts.values()) == {1}              # exactly one record per policy
+    assert len(out) == 8                            # total == number of test cases
+
+
+def test_apd_child_counts_stay_multi_row():
+    # APD keeps the multi-entry default (APD-006..009): several records per insured.
+    handler = ApdHandler()
+    prev = {"01_Policy_Info": [{"Test ID": f"TS-0{i:02d}"} for i in range(1, 9)]}
+    rows = [{"Test ID": f"TS-0{i:02d}", "VIN Number": f"V{i}"} for i in range(1, 9)]
+    out = handler.post_process(rows, "04_APD_Vehicles", "", prev)
+    counts = Counter(r["Test ID"] for r in out)
+    assert all(c >= 3 for c in counts.values())     # multi-row per insured

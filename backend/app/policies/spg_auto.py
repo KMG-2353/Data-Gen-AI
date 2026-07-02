@@ -44,6 +44,7 @@ from app.rulebook.primitives import (
     is_no as _is_no,
     normalize_sheet_name as _norm_sheet,
     parse_date as _parse_date,
+    pin_quote_effective_expiration as _pin_policy_dates,
     spread_pick as _spread_pick,
     tid_value as _tid,
 )
@@ -141,6 +142,12 @@ class _SpgAutoHandler:
         "loss_history": _LOSS_HISTORY_PER_INSURED,
     }
 
+    # When True the per-insured child count is *varied* above its minimum (APD:
+    # exercise the multi-entry capability). Cargo overrides to False so each policy
+    # carries exactly one child record by default (QA: "for 20 sets generate 20,
+    # not 60") — multiple only when a scenario explicitly requests more.
+    _vary_child_counts = True
+
     def build_sheet_context(
         self,
         sheet_name: str,
@@ -156,7 +163,7 @@ class _SpgAutoHandler:
             return original_row_count, self._policy_rules()
         if st == "commodities":
             return self._child_count(original_row_count, policy_data,
-                                     _COMMODITIES_PER_INSURED), self._commodities_rules()
+                                     self._CHILD_TARGETS["commodities"]), self._commodities_rules()
         per = self._CHILD_TARGETS.get(st)
         if per:
             return self._child_count(original_row_count, policy_data, per), ""
@@ -221,6 +228,14 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
 
         self._coerce_dropdowns(rows)
 
+        # APD-017/020/022/024: on a large request the LLM anchors to the first few
+        # Test IDs and stops, so most insureds receive *zero* child rows ("for 20
+        # sets, only 07 generated"). Child-row multiplicity is deterministic
+        # (CLAUDE.md §2): the Policy Info roster — not the LLM output — decides
+        # which insureds get a schedule, so every one of the N test cases is
+        # covered (mirrors the spg_pl HO large-set fix).
+        roster = [_tid(r) for r in _policy_rows(previous_sheets_data) if _tid(r)]
+
         if st in ("drivers", "vehicles", "trailers", "commodities"):
             unique = {
                 "drivers": ("license number",),
@@ -229,15 +244,17 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                 "commodities": (),
             }[st]
             # APD-014: vary the per-insured count so schedules don't follow a
-            # fixed "always N" / "2-2-1" pattern across policies.
+            # fixed "always N" / "2-2-1" pattern across policies. Cargo pins to one
+            # record per policy (vary off).
             return ensure_child_row_multiplicity(
                 rows, min_per_tid=self._CHILD_TARGETS[st], max_per_tid=_UNIT_MAX,
-                unique_frags=unique, vary_key=f"{self.policy_type}:{st}",
+                unique_frags=unique, vary_key=self._child_vary_key(st),
+                all_test_ids=roster or None,
             )
         if st == "loss_payees":
-            return self._fix_loss_payees(rows)
+            return self._fix_loss_payees(rows, roster)
         if st == "loss_history":
-            return self._fix_loss_history(rows)
+            return self._fix_loss_history(rows, roster, previous_sheets_data)
         return rows
 
     # ------------------------------------------------------------------
@@ -271,21 +288,24 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                     fill_blank=True,
                 )
 
-            eff_key = _find_col(row, "effective date")
-            quote_key = _find_col(row, "quote date") or _find_col(row, "date of quote")
-            if eff_key and quote_key:
-                eff = _parse_date(row.get(eff_key))
-                quote = _parse_date(row.get(quote_key))
-                if eff and (quote is None or quote > eff):
-                    row[quote_key] = _fmt_date(eff - timedelta(days=random.randint(1, 14)))
+            # APD-016 / CARGO-008(quote): Quote Date pinned to today (data-creation
+            # date), Effective clamped to >= today, Expiration = Effective + 1 year.
+            _pin_policy_dates(row)
 
     # ------------------------------------------------------------------
     # Child-schedule fixers
     # ------------------------------------------------------------------
 
-    def _fix_loss_payees(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _child_vary_key(self, st: str) -> str | None:
+        """Vary-key for a child schedule — ``None`` when the handler pins one
+        record per policy (Cargo), so counts are not fanned above the minimum."""
+        return f"{self.policy_type}:{st}" if self._vary_child_counts else None
+
+    def _fix_loss_payees(self, rows: list[dict[str, Any]],
+                         roster: list[str] | None = None) -> list[dict[str, Any]]:
         """APD-010: blank loss-payee detail when the policy has none, then
-        guarantee a 1–10 multi-row schedule per policy."""
+        guarantee a 1–10 schedule per policy (APD-024: for every insured on the
+        roster, not just the first few the LLM emitted)."""
         for row in rows:
             flag_key = _find_col(row, "have loss payees") or _find_col(row, "has loss payees")
             if flag_key and _is_no(row.get(flag_key)):
@@ -295,8 +315,9 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
                     if k:
                         row[k] = ""
         return ensure_child_row_multiplicity(
-            rows, min_per_tid=_LOSS_PAYEES_PER_INSURED, max_per_tid=_MAX_LOSS_PAYEES,
-            skip_predicate=self._no_loss_payees, vary_key=f"{self.policy_type}:loss_payees",
+            rows, min_per_tid=self._CHILD_TARGETS["loss_payees"], max_per_tid=_MAX_LOSS_PAYEES,
+            skip_predicate=self._no_loss_payees, vary_key=self._child_vary_key("loss_payees"),
+            all_test_ids=roster or None,
         )
 
     @staticmethod
@@ -304,20 +325,63 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
         k = _find_col(row, "have loss payees") or _find_col(row, "has loss payees")
         return bool(k) and _is_no(row.get(k))
 
-    def _fix_loss_history(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _fix_loss_history(self, rows: list[dict[str, Any]],
+                          roster: list[str] | None = None,
+                          previous_sheets_data: dict | None = None) -> list[dict[str, Any]]:
         """APD-011: blank loss detail for no-loss policies, then guarantee a
-        multi-row loss schedule (1–10) for policies that DID have losses."""
+        schedule (1–10) for policies that DID have losses (APD-022: for every
+        insured on the roster). Also enforces the loss-schedule data rules:
+        Loss Year within the past 3 years (Rule 130 — never the effective/future
+        year), and the per-policy "Any Unrepaired Damage from Prior Losses?" flag
+        held CONSISTENT across all of an insured's loss rows."""
+        # Effective year per insured (for the past-3-years Loss Year window).
+        eff_year_by_tid: dict[str, int] = {}
+        for pi in _policy_rows(previous_sheets_data):
+            eff = _parse_date(pi.get(_find_col(pi, "effective date") or ""))
+            if eff:
+                eff_year_by_tid[_tid(pi)] = eff.year
+
+        # Per-policy consistency of "Any Unrepaired Damage from Prior Losses?":
+        # it is one answer per submission, so reuse the insured's first value on
+        # every one of its loss rows.
+        unrep_by_tid: dict[str, Any] = {}
+        for row in rows:
+            uk = _find_col(row, "unrepaired")
+            if uk and _tid(row) not in unrep_by_tid and str(row.get(uk) or "").strip():
+                unrep_by_tid[_tid(row)] = row.get(uk)
+
         for row in rows:
             flag_key = _find_col(row, "losses in the past") or _find_col(row, "any losses")
             if flag_key and _is_no(row.get(flag_key)):
                 for frag in ("loss year", "type of loss", "loss description",
-                             "amount paid", "amount outstanding", "premium at time"):
+                             "amount paid", "amount outstanding", "premium at time",
+                             "unrepaired"):
                     k = _find_col(row, frag)
                     if k:
                         row[k] = ""
+                continue
+
+            # Rule 130: Loss Year strictly in the past 3 years (eff_year-3 ..
+            # eff_year-1); never the current/effective year or the future.
+            ly_key = _find_col(row, "loss year")
+            ey = eff_year_by_tid.get(_tid(row))
+            if ly_key and ey:
+                try:
+                    y = int(str(row.get(ly_key)).strip())
+                except (TypeError, ValueError):
+                    y = None
+                if y is None or not (ey - 3 <= y <= ey - 1):
+                    row[ly_key] = str(ey - 1 - (_col_seed(_tid(row)) % 3))
+
+            # Hold the per-policy unrepaired-damage answer consistent.
+            uk = _find_col(row, "unrepaired")
+            if uk and _tid(row) in unrep_by_tid:
+                row[uk] = unrep_by_tid[_tid(row)]
+
         return ensure_child_row_multiplicity(
-            rows, min_per_tid=_LOSS_HISTORY_PER_INSURED, max_per_tid=_MAX_LOSS_HISTORY,
-            skip_predicate=self._no_losses, vary_key=f"{self.policy_type}:loss_history",
+            rows, min_per_tid=self._CHILD_TARGETS["loss_history"], max_per_tid=_MAX_LOSS_HISTORY,
+            skip_predicate=self._no_losses, vary_key=self._child_vary_key("loss_history"),
+            all_test_ids=roster or None,
         )
 
     @staticmethod
@@ -407,6 +471,13 @@ SPG COMMERCIAL AUTO — POLICY INFORMATION RULES (HARD CONSTRAINTS):
 
 class CargoHandler(_SpgAutoHandler):
     policy_type = "CARGO"
+
+    # QA (Cargo driver/vehicle/commodities/losshistory/losspayees defects): "for
+    # 20 sets the system generates 60 instead of 20." Cargo pins ONE child record
+    # per policy so N test cases yield ~N records; multiple per policy only when a
+    # scenario explicitly requests it. (APD keeps the multi-entry default.)
+    _vary_child_counts = False
+    _CHILD_TARGETS = {k: 1 for k in _SpgAutoHandler._CHILD_TARGETS}
 
     def _commodities_rules(self) -> str:
         return f"""

@@ -32,6 +32,7 @@ from app.rulebook.primitives import (
     coerce_to_allowed as _coerce,
     spread_pick as _spread_pick,
     column_seed as _col_seed,
+    pin_quote_effective_expiration as _pin_policy_dates,
 )
 from app.rulebook.variety import ensure_child_row_multiplicity
 
@@ -441,31 +442,11 @@ SPG PERSONAL LINES — LOSS HISTORY RULES (HARD CONSTRAINTS):
             if prod_key:
                 row[prod_key] = self._product_default
 
-            # Quote Date must be the data-creation date (today): never a past or
-            # future date. [DEF-002 / HO-002]
-            eff_key = _find_col(row, "effective date")
-            exp_key = _find_col(row, "expiration date")
-            quote_key = _find_col(row, "quote date")
-            eff = _parse_date(row.get(eff_key)) if eff_key else None
-
-            # DEF-023 / HO-022: the Effective Date must be on or after the Quote
-            # Date (today) — coverage cannot begin before the quote is created.
-            # Quote is pinned to today, so clamp any earlier effective date up to
-            # today before deriving the expiration from it.
-            if eff and eff < date.today():
-                eff = date.today()
-                if eff_key:
-                    row[eff_key] = _fmt_date(eff)
-
-            # Expiration = Effective + 1 year. [Rule 4/5]
-            if eff and exp_key:
-                try:
-                    row[exp_key] = _fmt_date(eff.replace(year=eff.year + 1))
-                except ValueError:  # Feb 29
-                    row[exp_key] = _fmt_date(eff + timedelta(days=365))
-
-            if quote_key:
-                row[quote_key] = _fmt_date(date.today())
+            # Quote Date pinned to today (data-creation date), Effective clamped
+            # to >= today (DEF-023 / HO-022: coverage cannot begin before the
+            # quote is created), Expiration = Effective + 1 year. [DEF-002 / HO-002,
+            # Rule 4/5] — the SPG-wide single-source date rule.
+            _pin_policy_dates(row)
 
             # Rule 21: PA binding state forces 10% commission.
             bind_key = _find_col(row, "binding state")

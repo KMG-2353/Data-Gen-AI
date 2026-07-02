@@ -65,11 +65,39 @@ def test_date_of_quote_clamped_after_effective(handler):
         assert quote is not None and quote <= eff
 
 
-def test_valid_quote_date_preserved(handler):
-    rows = [{"Test ID": "PI-001", "Effective Date": "05/27/2026",
-             "Date of Quote": "05/20/2026", "Type of Entity": "LLC"}]
+def test_quote_date_pinned_to_today(handler):
+    # DF-IM-022: Date of Quote must default to TODAY (the data-creation date),
+    # never a past/future date — regardless of what the LLM emitted.
+    from datetime import date
+    from app.rulebook.primitives import format_date_slash
+
+    today = format_date_slash(date.today())
+    # A FUTURE effective date is preserved; quote is still today; expiration = eff+1yr.
+    rows = [{"Test ID": "PI-001", "Effective Date": "12/01/2027",
+             "Expiration Date": "", "Date of Quote": "05/20/2026",
+             "Type of Entity": "LLC"}]
     out = handler.post_process(rows, "Policy Info", "")
-    assert out[0]["Date of Quote"] == "05/20/2026"
+    assert out[0]["Date of Quote"] == today
+    assert out[0]["Effective Date"] == "12/01/2027"
+    assert out[0]["Expiration Date"] == "12/01/2028"
+
+
+def test_past_effective_clamped_to_today(handler):
+    # DF-IM-020: coverage cannot begin before the quote (today); a past effective
+    # date is clamped up to today and the expiration re-derived from it.
+    from datetime import date
+    from app.rulebook.primitives import format_date_slash, add_one_year
+
+    today = date.today()
+    rows = [{"Test ID": "PI-001", "Effective Date": "05/27/2026",
+             "Expiration Date": "", "Date of Quote": "05/20/2026",
+             "Type of Entity": "LLC"}]
+    out = handler.post_process(rows, "Policy Info", "")
+    assert out[0]["Effective Date"] == format_date_slash(today)
+    assert out[0]["Date of Quote"] == format_date_slash(today)
+    assert out[0]["Expiration Date"] == format_date_slash(add_one_year(today))
+    # quote <= effective always holds
+    assert _parse_date(out[0]["Date of Quote"]) <= _parse_date(out[0]["Effective Date"])
 
 
 def test_test_ids_stamped_with_global_ts_prefix(handler):

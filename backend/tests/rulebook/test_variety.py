@@ -228,3 +228,78 @@ def test_consistency_covers_generic_multi_block():
     r = rows[0]
     assert _CITYZIP_TO_STATE[(r["City"], r["ZIP"])] == "FL"
     assert _CITYZIP_TO_STATE[(r["Mailing City"], r["Mailing ZIP"])] == "WA"
+
+
+# ---------------------------------------------------------------------------
+# APD-019/021/023/025 — expanded child schedules must be VARIED, not byte-
+# identical clones of a single row. When a group needs more rows than the LLM
+# emitted, the extra rows are drawn from OTHER insureds' real rows (restamped to
+# this group's Test ID) so the schedule carries genuine variety.
+# ---------------------------------------------------------------------------
+
+def test_child_expansion_pulls_varied_donor_rows():
+    from app.rulebook.variety import ensure_child_row_multiplicity
+
+    # Three insureds, each with ONE distinct commodity row. Every insured needs a
+    # multi-row schedule (min 3), so 2 rows per insured are added by expansion.
+    rows = [
+        {"Test ID": "TS-001", "Commodity": "Electronics", "Value": "100"},
+        {"Test ID": "TS-002", "Commodity": "Produce", "Value": "200"},
+        {"Test ID": "TS-003", "Commodity": "Steel", "Value": "300"},
+    ]
+    out = ensure_child_row_multiplicity(rows, min_per_tid=3, max_per_tid=20)
+
+    # Every group reaches the minimum and keeps its own Test ID.
+    from collections import Counter
+    counts = Counter(r["Test ID"] for r in out)
+    assert all(c >= 3 for c in counts.values())
+    assert set(counts) == {"TS-001", "TS-002", "TS-003"}
+
+    # Within each expanded group the rows are NOT all identical: the added rows
+    # carry commodity values sourced from the donor pool, so >1 distinct value
+    # appears per insured (no duplicate-data schedule).
+    for tid in ("TS-001", "TS-002", "TS-003"):
+        vals = {r["Commodity"] for r in out if r["Test ID"] == tid}
+        assert len(vals) >= 2
+
+
+def test_roster_constrains_child_test_ids_and_drops_orphans():
+    # Cross-sheet consistency: when asked for a scaled count the LLM invents extra
+    # Test IDs (TS-021…). With the Policy roster supplied, child rows must join a
+    # REAL policy — orphan Test IDs never appear in output — while their content is
+    # still reused as donor variety.
+    from collections import Counter
+    from app.rulebook.variety import ensure_child_row_multiplicity
+
+    roster = [f"TS-{i:03d}" for i in range(1, 4)]      # only 3 real policies
+    rows = [{"Test ID": f"TS-{i:03d}", "Commodity": f"C{i}", "Value": str(i)}
+            for i in range(1, 13)]                     # LLM produced TS-001..TS-012
+    out = ensure_child_row_multiplicity(
+        rows, min_per_tid=3, max_per_tid=20, all_test_ids=roster)
+
+    assert {r["Test ID"] for r in out} == set(roster)   # no orphan TS-004..TS-012
+    counts = Counter(r["Test ID"] for r in out)
+    assert all(c >= 3 for c in counts.values())         # every real policy covered
+    assert len({r["Commodity"] for r in out}) >= 3      # orphan content reused
+
+
+def test_skip_group_collapses_duplicate_blank_rows():
+    # A no-loss insured must carry exactly ONE row even when the LLM emitted
+    # several identical blank rows for it (DW/HO no-loss blank-row duplication).
+    from app.rulebook.variety import ensure_child_row_multiplicity
+
+    def no_loss(r):
+        return str(r.get("Any Losses?", "")).strip().lower() == "no"
+
+    rows = [
+        {"Test ID": "TS-01", "Any Losses?": "No", "Amount": ""},
+        {"Test ID": "TS-01", "Any Losses?": "No", "Amount": ""},   # duplicate blank
+        {"Test ID": "TS-01", "Any Losses?": "No", "Amount": ""},   # duplicate blank
+        {"Test ID": "TS-02", "Any Losses?": "Yes", "Amount": "1000"},
+    ]
+    out = ensure_child_row_multiplicity(
+        rows, min_per_tid=2, max_per_tid=10, skip_predicate=no_loss)
+    from collections import Counter
+    counts = Counter(r["Test ID"] for r in out)
+    assert counts["TS-01"] == 1      # collapsed, no duplicate blanks
+    assert counts["TS-02"] >= 2      # has-loss insured still expands

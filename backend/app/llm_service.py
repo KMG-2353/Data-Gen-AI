@@ -16,6 +16,12 @@ from app.rulebook.primitives import (
     normalize_sheet_name as _normalize_sheet_name,
 )
 
+# Rows requested per LLM call. Small enough that the model reliably returns the
+# exact count without truncating its JSON (the "asked 50, got 16" defect);
+# generate_test_data loops batches until the full requested count is reached.
+_GEN_BATCH_SIZE = int(os.getenv("GEN_BATCH_SIZE", "20"))
+
+
 def _clean_response_text(text: str) -> str:
     """Normalize common fenced-code formatting around model output."""
     cleaned = text.strip()
@@ -485,13 +491,29 @@ INSURANCE DOMAIN RULES (MUST FOLLOW):
 {additional_rules}
 """
 
-    prompt = f"""You are a test data generator for US insurance applications.
+    def _build_prompt(batch_n: int, produced_so_far: int, avoid_sample: list[dict[str, Any]]) -> str:
+        # When generating a large dataset in batches, tell the model where it is so
+        # it produces fresh, non-duplicate rows and never restarts numbering. The
+        # de-dup sample is a few already-produced rows the model must NOT repeat.
+        continuation_block = ""
+        if produced_so_far:
+            continuation_block = f"""
+BATCH CONTINUATION (IMPORTANT):
+This is a continuation of a larger dataset. {produced_so_far} rows have ALREADY
+been generated. Generate the NEXT {batch_n} rows ONLY — brand-new records that are
+DIFFERENT from every prior row and from each other (fresh names, addresses, policy
+numbers, VINs, phone numbers). Do NOT repeat earlier rows and do NOT restart at the
+first record. A few already-generated rows are shown ONLY so you can avoid
+duplicating them — do not reproduce them:
+{json.dumps(avoid_sample, indent=2)}
+"""
+        return f"""You are a test data generator for US insurance applications.
 
 You are generating data for sheet: "{sheet_name}"
 
-Generate exactly {effective_row_count} rows of realistic test data for the following columns:
+Generate exactly {batch_n} rows of realistic test data for the following columns:
 {json.dumps(headers)}
-
+{continuation_block}
 DUPLICATE COLUMN HANDLING:
 Some columns may have a suffix like "(Col X)" — this means the original spreadsheet has multiple columns with the same name.
 You MUST generate DIFFERENT values for each such column. For example, "Address (Col 3)" and "Address (Col 7)" are two separate columns that need different address values.
@@ -526,9 +548,9 @@ IMPORTANT RULES:
 7. For vehicles, use exact data from the VIN table provided in the rules.
 8. All the Dollar values should be numbers and not in string. But should have a dollar sign before them.
 9. The effective date, endorsement date should match across all sheets for same test case.
-10. CRITICAL: Generate EXACTLY {effective_row_count} rows. No more, no less.
+10. CRITICAL: Generate EXACTLY {batch_n} rows. No more, no less.
 
-Return a JSON object with a single key "data" whose value is an array of {effective_row_count} objects.
+Return a JSON object with a single key "data" whose value is an array of {batch_n} objects.
 Each object must use the exact column names as keys.
 No markdown, no explanation, just the JSON object.
 
@@ -536,61 +558,87 @@ Example format:
 {{"data": [{{"column1": "value1", "column2": "value2"}}, ...]}}
 """
 
-    # Retry up to 2 times for rate limits only. JSON mode guarantees valid output.
-    max_retries = 2
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                temperature=1,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a precise JSON-only data generator for US insurance test datasets. "
-                            "Always return a JSON object with a single key \"data\" containing an array of row objects. "
-                            "If insurance domain rules specify exact row mappings with Test Case No values, follow them EXACTLY. "
-                            "If user special instructions conflict with defaults, follow user special instructions."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-            )
-
-            content = response.choices[0].message.content
-            text: str = content if isinstance(content, str) else ""
-            if not text.strip():
-                raise ValueError("OpenAI returned an empty response")
-
-            data = _parse_json_array(text)
-
-            # Ensure all rows have all requested headers.
-            normalized: list[dict[str, Any]] = []
-            for row in data:
-                if isinstance(row, dict):
-                    normalized.append({header: row.get(header, "") for header in headers})
-            if not normalized:
-                raise ValueError("Model output did not contain valid row objects")
-
-            normalized = _enforce_effective_expiration_date_range(
-                normalized,
-                special_instruction,
-            )
-
-            return normalized
-        except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
-                wait_time = 60 * (attempt + 1)
-                print(f"Rate limit hit for sheet '{sheet_name}'. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
-                time.sleep(wait_time)
-                if attempt == max_retries - 1:
+    def _run_batch(prompt: str) -> list[dict[str, Any]]:
+        """One LLM call → normalized rows. Retries on rate limits only."""
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                response = client.chat.completions.create(
+                    model=model_name,
+                    temperature=1,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a precise JSON-only data generator for US insurance test datasets. "
+                                "Always return a JSON object with a single key \"data\" containing an array of row objects. "
+                                "If insurance domain rules specify exact row mappings with Test Case No values, follow them EXACTLY. "
+                                "If user special instructions conflict with defaults, follow user special instructions."
+                            ),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                content = response.choices[0].message.content
+                text: str = content if isinstance(content, str) else ""
+                if not text.strip():
+                    raise ValueError("OpenAI returned an empty response")
+                data = _parse_json_array(text)
+                return [
+                    {header: row.get(header, "") for header in headers}
+                    for row in data
+                    if isinstance(row, dict)
+                ]
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg or "quota" in error_msg.lower() or "rate" in error_msg.lower():
+                    wait_time = 60 * (attempt + 1)
+                    print(f"Rate limit hit for sheet '{sheet_name}'. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(wait_time)
+                    if attempt == max_retries - 1:
+                        raise
+                else:
                     raise
-            else:
-                raise
+        raise RuntimeError("OpenAI response was not received after retries")
 
-    raise RuntimeError("OpenAI response was not received after retries")
+    # Deterministic exact-count guarantee. Large single-shot requests truncate —
+    # the LLM asked for 50 returns ~16 (defect: "generating 50, getting 16"). We
+    # instead request the rows in small batches and loop until the FULL count is
+    # collected, then trim/pad to exactly ``effective_row_count`` (any N:
+    # 100/200/500 …). Row count is a deterministic field (CLAUDE.md §2) — the
+    # engine produces the exact count rather than trusting the LLM to.
+    collected: list[dict[str, Any]] = []
+    empty_streak = 0
+    # Generous ceiling so we never loop forever if the model keeps under-delivering.
+    max_batches = ((effective_row_count + _GEN_BATCH_SIZE - 1) // _GEN_BATCH_SIZE) * 2 + 3
+    for _ in range(max_batches):
+        if len(collected) >= effective_row_count:
+            break
+        need = min(_GEN_BATCH_SIZE, effective_row_count - len(collected))
+        prompt = _build_prompt(need, len(collected), collected[-3:])
+        batch = _run_batch(prompt)
+        if not batch:
+            empty_streak += 1
+            if empty_streak >= 2:
+                break
+            continue
+        empty_streak = 0
+        collected.extend(batch)
+
+    if not collected:
+        raise ValueError("Model output did not contain valid row objects")
+
+    # Exact-count guarantee: trim any overflow; pad any shortfall by cloning
+    # existing rows round-robin (rare — only if batching still under-delivered).
+    # Downstream handlers re-stamp Test IDs sequentially, so padded rows still
+    # become distinct records.
+    if len(collected) > effective_row_count:
+        collected = collected[:effective_row_count]
+    else:
+        i = 0
+        while len(collected) < effective_row_count:
+            collected.append(dict(collected[i % len(collected)]))
+            i += 1
+
+    return _enforce_effective_expiration_date_range(collected, special_instruction)

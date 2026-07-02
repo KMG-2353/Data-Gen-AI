@@ -131,43 +131,91 @@ def ensure_child_row_multiplicity(
             order.append(t)
         groups[t].append(r)
 
+    tid_key_all = _tid_key(rows[0])
+
     if all_test_ids:
-        tid_key = _tid_key(rows[0])
-        donors = list(rows)
+        # The Policy roster OWNS the child Test IDs (deterministic cross-sheet
+        # key). When asked for a scaled row count the LLM invents extra Test IDs
+        # (TS-021…TS-060 for a 20-insured request); those orphan rows must NOT
+        # appear in output — every child row must join a real policy — but their
+        # content is reused as donor variety so nothing is wasted. Output is
+        # therefore restricted to EXACTLY the roster, in roster order.
+        roster = list(all_test_ids)
+        roster_set = set(roster)
+        orphan_rows = [r for r in rows if tid_value(r) not in roster_set]
+        roster_groups = {t: list(groups.get(t, [])) for t in roster}
+        # Seed empty roster groups from a donor (prefer an orphan's real content).
+        donors = orphan_rows or list(rows)
         di = 0
-        for t in all_test_ids:
-            if t in groups:
+        for t in roster:
+            if roster_groups[t]:
                 continue
-            seed = dict(donors[di % len(donors)])
+            seed = dict(donors[di % len(donors)]) if donors else {}
             di += 1
-            if tid_key:
-                seed[tid_key] = t
+            if tid_key_all:
+                seed[tid_key_all] = t
             # Keep unique identifiers (Loan Number, Serial/VIN, …) distinct across
             # insureds — the donor's value belongs to another Test ID.
             for uf in unique_frags:
                 col = find_col(seed, uf)
                 if col and str(seed.get(col) or "").strip():
                     seed[col] = f"{seed[col]}-{t}"
-            groups[t] = [seed]
-            order.append(t)
+            roster_groups[t] = [seed]
+        groups = roster_groups
+        order = roster
+
+    # Donor pool for expansion variety: every produced row except single-blank
+    # "skip" rows (e.g. a no-loss loss-history row). When a group needs MORE rows
+    # than the LLM emitted for it, the added rows are drawn from this pool — real
+    # rows authored for OTHER insureds, restamped to this group's Test ID — so an
+    # expanded schedule is genuinely varied instead of byte-identical clones of a
+    # single row (APD-019/021/023/025 "generating duplicate data"). Orphan rows
+    # stay in the pool as donor variety even though they are not output on their
+    # own Test ID.
+    donor_pool = [r for r in rows if not (skip_predicate and skip_predicate(r))]
 
     out: list[dict[str, Any]] = []
-    for t in order:
+    for gi, t in enumerate(order):
         grp = list(groups[t][:max_per_tid])
         seeds = list(grp)
-        if seeds and not (skip_predicate and skip_predicate(seeds[0])):
+        if seeds and skip_predicate and skip_predicate(seeds[0]):
+            # A "skip" insured (no losses / no loss payees) must carry exactly ONE
+            # row. The LLM sometimes emits several identical blank rows for it —
+            # collapse them so the schedule shows a single no-detail row, not
+            # duplicates (DW/HO no-loss blank-row duplication).
+            grp = grp[:1]
+        elif seeds:
             target = (_varied_target(vary_key, t, min_per_tid, max_per_tid)
                       if vary_key is not None else min_per_tid)
-            k = 0
+            # Prefer varied donors from the full pool; fall back to the group's own
+            # rows if the pool is empty. Offset the start per group so different
+            # insureds pull different donors (avoids everyone cloning row 0).
+            sources = donor_pool or seeds
+            # Track the content already in the group so an added clone never
+            # duplicates an existing row (schedules with no unique_frags / no "#"
+            # column — e.g. Commodities — would otherwise repeat identical rows).
+            seen = {tuple(sorted(r.items(), key=lambda kv: kv[0])) for r in grp}
+            k = gi
             while len(grp) < target:
-                clone = dict(seeds[k % len(seeds)])
-                suffix = len(grp) + 1
-                for uf in unique_frags:
-                    col = find_col(clone, uf)
-                    if col and str(clone.get(col) or "").strip():
-                        clone[col] = f"{clone[col]}-{suffix}"
+                tried = 0
+                while tried < len(sources):
+                    clone = dict(sources[k % len(sources)])
+                    if tid_key_all:
+                        clone[tid_key_all] = t
+                    suffix = len(grp) + 1
+                    for uf in unique_frags:
+                        col = find_col(clone, uf)
+                        if col and str(clone.get(col) or "").strip():
+                            clone[col] = f"{clone[col]}-{suffix}"
+                    sig = tuple(sorted(clone.items(), key=lambda kv: kv[0]))
+                    k += 1
+                    tried += 1
+                    if sig not in seen:
+                        break
+                # If every donor duplicates an existing row, accept the last one
+                # (target multiplicity wins over a marginal duplicate).
+                seen.add(sig)
                 grp.append(clone)
-                k += 1
         ncol = _number_col(grp[0]) if grp else None
         if ncol:
             for i, r in enumerate(grp, start=1):
