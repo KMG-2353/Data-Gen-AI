@@ -14,7 +14,7 @@ from app.policies import get_handler
 from app.rulebook import config as rb_config
 from app.rulebook.profiles import select_profile
 from app.rulebook.scenario import parse_scenarios
-from app.rulebook.variety import enforce_variety_fields
+from app.rulebook.variety import enforce_address_consistency, enforce_variety_fields
 
 # SPG rater family that shares the universal dropdown-variety contract
 # (phone/fax format + address-state spread). RRG/IMS/PAP manage their own
@@ -389,6 +389,22 @@ async def generate_data(request: dict):
             if policy_type == "PAP" and sheet_type == "policy" and data:
                 data = _pap_enforce_field_rules(data)
                 print(f"PAP field rules enforced on '{sheet_name}'")
+
+            # Universal City/State/ZIP correspondence for the remaining LOBs
+            # (GENERIC / RRG / IMS / any uploaded template). SPG already ran the
+            # spread+consistency pass above; PAP carries real Census-verified
+            # addresses. Deterministic: snaps City/ZIP to the row's own state,
+            # never changing the state. Closes the HO-023 / WH-004 address class on
+            # every LOB, not just SPG. Runs after IMS state enforcement so City/ZIP
+            # match the enforced state.
+            if (
+                rb_config.RULEBOOK_ENABLED
+                and policy_type not in _SPG_LOBS
+                and policy_type != "PAP"
+                and sheet_type != "scenario_details"
+                and data
+            ):
+                data = enforce_address_consistency(data)
 
             generated_data_by_sheet[sheet_name] = {
                 "original_headers": original_headers,

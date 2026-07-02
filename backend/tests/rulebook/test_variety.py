@@ -166,3 +166,65 @@ def test_every_state_has_geo():
     # Every state in the spread pool must have a consistent geo triple available.
     for st in US_STATES:
         assert STATE_GEO.get(st), f"missing geo for {st}"
+
+
+# ---------------------------------------------------------------------------
+# HO-023 / WH-004 — City/State/ZIP correspondence must hold on EVERY LOB.
+# ---------------------------------------------------------------------------
+
+from app.rulebook.variety import _addr_kind, enforce_address_consistency
+
+
+def test_stated_amount_not_misclassified_as_state():
+    # "Stated Amount or ACV" (APD/Cargo) contains the letters "state" but is a
+    # value column — it must never be treated as an address State and clobbered.
+    assert _addr_kind("Stated Amount or ACV") is None
+    assert _addr_kind("Real Estate Value") is None
+    assert _addr_kind("Interstate Miles") is None
+    # genuine address columns still classify
+    assert _addr_kind("Agency Address State") == "state"
+    assert _addr_kind("Insured Address City") == "city"
+    assert _addr_kind("Mailing ZIP") == "zip"
+
+
+def test_spread_preserves_stated_amount_value():
+    rows = [{"Test ID": "TS-01", "Stated Amount or ACV": "50000",
+             "Address State": "NY", "Address City": "x", "Address ZIP": "0"}]
+    spread_address_states(rows)
+    assert rows[0]["Stated Amount or ACV"] == "50000"      # not overwritten
+    assert _ZIP_TO_STATE[rows[0]["Address ZIP"]] == rows[0]["Address State"]
+
+
+def test_consistency_repairs_mismatch_keeping_state():
+    # The exact HO-023 / WH-004 symptom: valid ZIP but for a different state.
+    rows = [{"Test ID": "TS-01", "Insured Address State": "TX",
+             "Insured Address City": "Miami", "Insured Address ZIP": "33130"}]
+    enforce_address_consistency(rows)
+    r = rows[0]
+    assert r["Insured Address State"] == "TX"                       # state unchanged
+    assert (r["Insured Address City"], r["Insured Address ZIP"]) in _CITYZIP_TO_STATE
+    assert _CITYZIP_TO_STATE[(r["Insured Address City"], r["Insured Address ZIP"])] == "TX"
+
+
+def test_consistency_is_idempotent_and_preserves_valid_triple():
+    rows = [{"State": "CA", "City": "San Diego", "ZIP": "92101"}]
+    enforce_address_consistency(rows)
+    assert rows[0] == {"State": "CA", "City": "San Diego", "ZIP": "92101"}
+
+
+def test_consistency_preserves_blank_state_block():
+    rows = [{"Mailing State": "", "Mailing City": "keep", "Mailing ZIP": "keepz"}]
+    enforce_address_consistency(rows)
+    assert rows[0]["Mailing City"] == "keep" and rows[0]["Mailing ZIP"] == "keepz"
+
+
+def test_consistency_covers_generic_multi_block():
+    # A generic uploaded template with two independent address blocks, both wrong.
+    rows = [{
+        "State": "FL", "City": "Denver", "ZIP": "80202",           # CO city/zip under FL
+        "Mailing State": "WA", "Mailing City": "Austin", "Mailing ZIP": "78701",  # TX under WA
+    }]
+    enforce_address_consistency(rows)
+    r = rows[0]
+    assert _CITYZIP_TO_STATE[(r["City"], r["ZIP"])] == "FL"
+    assert _CITYZIP_TO_STATE[(r["Mailing City"], r["Mailing ZIP"])] == "WA"

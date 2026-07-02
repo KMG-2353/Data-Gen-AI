@@ -209,19 +209,27 @@ def _binding_value(row: dict[str, Any]) -> str | None:
 _KIND_STRIP = {"zip", "zipcode", "postal", "code", "city", "state", "st"}
 
 
+_STATE_WORD = re.compile(r"\bstate\b")
+_CITY_WORD = re.compile(r"\bcity\b")
+
+
 def _addr_kind(col: str) -> str | None:
     """Classify an address column as ``state`` / ``city`` / ``zip`` (or None).
 
     The Binding/Rating dropdown is never an address column (it stays untouched).
+    ``state`` / ``city`` match on **whole words** so value columns that merely
+    contain the letters — "Stated Amount or ACV", "Real Estate", "Interstate",
+    "Velocity" — are never mistaken for an address column and clobbered with a
+    state code / city name.
     """
     if is_binding_state_field(col):
         return None
     kl = col.strip().lower()
     if "zip" in kl or "postal" in kl:
         return "zip"
-    if "city" in kl:
+    if _CITY_WORD.search(kl):
         return "city"
-    if "state" in kl or kl == "st":
+    if _STATE_WORD.search(kl) or kl == "st":
         return "state"
     return None
 
@@ -301,6 +309,55 @@ def spread_address_states(
                 continue
             geo = geo_for_state(state)
             if not geo:
+                continue
+            city, zipcode = spread_pick(i, geo, seed=seed + 1)
+            if city_col:
+                row[city_col] = city
+            if zip_col:
+                row[zip_col] = zipcode
+    return rows
+
+
+def enforce_address_consistency(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Snap each address block's City/ZIP to correspond to its **own State**,
+    without changing the state.
+
+    This is the consistency half of :func:`spread_address_states` with the state
+    *spread* removed: the state the row already carries is authoritative, and only
+    City/ZIP are repaired to belong to it (from :data:`~app.rulebook.geo.STATE_GEO`).
+    It closes the City/State/ZIP correspondence class (HO-023 / WH-004 and kin) for
+    the LOBs that do **not** run the SPG state-spread pass — GENERIC and any uploaded
+    template — so a valid-but-mismatched ZIP can never survive on any LOB. PAP is
+    excluded by the caller (it carries real Census-verified addresses).
+
+    Idempotent: a cell that already forms a valid geo triple for its state is left
+    untouched, so re-running on already-consistent SPG output is a no-op, and the
+    intentional blanks handlers leave (dependency rules) are preserved.
+    """
+    if not rows:
+        return rows
+    for cols in _address_blocks(rows[0].keys()).values():
+        state_col = cols.get("state")
+        city_col = cols.get("city")
+        zip_col = cols.get("zip")
+        if not state_col or not (city_col or zip_col):
+            continue
+        seed = column_seed(state_col)
+        for i, row in enumerate(rows):
+            state = str(row.get(state_col) or "").strip().upper()
+            if not state:
+                continue  # blank state -> nothing to correspond to (preserve blank)
+            geo = geo_for_state(state)
+            if not geo:
+                continue
+            cur_city = str(row.get(city_col) or "").strip() if city_col else ""
+            cur_zip = str(row.get(zip_col) or "").strip() if zip_col else ""
+            already_ok = (
+                (not city_col or any(c == cur_city for c, _ in geo))
+                and (not zip_col or any(z == cur_zip for _, z in geo))
+                and (not (city_col and zip_col) or (cur_city, cur_zip) in {p for p in geo})
+            )
+            if already_ok:
                 continue
             city, zipcode = spread_pick(i, geo, seed=seed + 1)
             if city_col:
